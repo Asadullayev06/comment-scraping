@@ -1,0 +1,250 @@
+"""User History Lookup command handlers for Telegram deep scanning."""
+
+import html
+from typing import Optional, List, Dict, Any
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery, BufferedInputFile
+from aiogram.filters import Command
+from aiogram.enums import ParseMode
+import structlog
+from src.db.base import async_session_factory
+from src.db.repositories.author_repo import AuthorRepository
+from src.db.repositories.comment_repo import CommentRepository
+
+logger = structlog.get_logger(__name__)
+router = Router(name="lookup_router")
+
+# Shared MTProto collector instance reference
+_mtproto_collector = None
+
+
+def set_mtproto_collector_instance(collector):
+    global _mtproto_collector
+    _mtproto_collector = collector
+
+
+def generate_html_report(author_name: str, user_id: str, mode: str, comments: List[Dict[str, Any]]) -> str:
+    """Generate self-contained HTML report document for extensive comment histories."""
+    rows = []
+    for c in comments:
+        severity_badge = f'<span style="color: {"red" if c["severity_score"] >= 7 else "gray"}; font-weight: bold;">{c["severity_score"]}/10</span>'
+        link_html = f'<a href="{c["url"]}" target="_blank">View</a>' if c.get("url") else "N/A"
+        rows.append(
+            f"""
+            <tr>
+                <td>{html.escape(c["published_at"])}</td>
+                <td>{html.escape(c["source"] or "Unknown")}</td>
+                <td>{severity_badge}</td>
+                <td>{html.escape(c["text"])}</td>
+                <td><i>{html.escape(c.get("llm_reason") or "")}</i></td>
+                <td>{link_html}</td>
+            </tr>
+            """
+        )
+
+    tbody = "\n".join(rows)
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>User History Report - {html.escape(author_name)} ({user_id})</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 30px; background: #f8f9fa; }}
+        h1 {{ color: #212529; }}
+        .header {{ background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 20px; }}
+        table {{ width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+        th, td {{ padding: 12px 15px; text-align: left; border-bottom: 1px solid #dee2e6; }}
+        th {{ background: #007bff; color: white; }}
+        tr:hover {{ background-color: #f1f3f5; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>User Comment History Report</h1>
+        <p><strong>User:</strong> {html.escape(author_name)} | <strong>ID:</strong> {user_id} | <strong>Mode:</strong> {mode.upper()}</p>
+        <p><strong>Total Comments Found:</strong> {len(comments)}</p>
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th style="width: 140px;">Date (UTC)</th>
+                <th style="width: 180px;">Source / Group</th>
+                <th style="width: 80px;">Severity</th>
+                <th>Comment Text</th>
+                <th>AI Reason</th>
+                <th style="width: 70px;">Link</th>
+            </tr>
+        </thead>
+        <tbody>
+            {tbody}
+        </tbody>
+    </table>
+</body>
+</html>"""
+
+
+@router.message(Command("lookup"))
+async def cmd_lookup_user(message: Message):
+    """Deep scan across mutual groups for a specific Telegram @username or numeric ID."""
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply(
+            "<b>Usage:</b> <code>/lookup &lt;@username_or_id&gt; [all|negative]</code>\n\n"
+            "<b>Examples:</b>\n"
+            "• <code>/lookup @johndoe all</code> — Return all comments from mutual groups\n"
+            "• <code>/lookup @johndoe negative</code> — Return only severely negative comments\n"
+            "• <code>/lookup 123456789 negative</code> — Search by numeric Telegram ID",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    target_input = args[1].strip()
+    filter_mode = "all"
+    if len(args) >= 3 and args[2].lower() in ["negative", "neg", "flagged"]:
+        filter_mode = "negative"
+
+    progress_msg = await message.reply(
+        f"🔎 <b>Searching mutual groups & channels for</b> <code>{html.escape(target_input)}</code>...\n"
+        f"<i>Mode: {filter_mode.upper()}</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    comments: List[Dict[str, Any]] = []
+    author_info = None
+
+    # Try live MTProto scan if collector is active
+    if _mtproto_collector and _mtproto_collector.client and _mtproto_collector.client.is_connected():
+        try:
+            author, comments, total_scanned = await _mtproto_collector.lookup_user_history(
+                username_or_id=target_input,
+                filter_mode=filter_mode,
+            )
+            author_info = author
+        except Exception as scan_err:
+            logger.error("MTProto lookup failed", error=str(scan_err))
+
+    # If MTProto scan returned nothing or not connected, query local database
+    if not comments:
+        async with async_session_factory() as session:
+            author_repo = AuthorRepository(session)
+            comment_repo = CommentRepository(session)
+
+            clean = target_input.lstrip("@")
+            if clean.isdigit():
+                author = await author_repo.get_by_platform_and_user_id("telegram", clean)
+            else:
+                author = await author_repo.get_by_platform_and_username("telegram", clean)
+
+            if author:
+                author_info = author
+                db_comments = await comment_repo.get_user_comments(
+                    platform="telegram",
+                    external_user_id=author.external_user_id,
+                    only_negative=(filter_mode == "negative"),
+                    limit=100,
+                )
+                comments = [
+                    {
+                        "id": c.id,
+                        "text": c.content_text,
+                        "source": c.source_name,
+                        "url": c.comment_url,
+                        "published_at": c.published_at.strftime("%Y-%m-%d %H:%M:%S") if c.published_at else "Unknown",
+                        "severity_score": c.severity_score or 0,
+                        "is_severely_negative": c.is_severely_negative,
+                        "llm_reason": c.llm_reason,
+                    }
+                    for c in db_comments
+                ]
+
+    if not comments:
+        await progress_msg.edit_text(
+            f"ℹ️ <b>No {'negative ' if filter_mode == 'negative' else ''}comments found for</b> <code>{html.escape(target_input)}</code>.\n\n"
+            f"<i>Note: If live MTProto userbot is not yet connected, only comments already archived in the database are queried.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Build summary header
+    author_name = author_info.display_name if author_info else target_input
+    user_id_str = author_info.external_user_id if author_info else "N/A"
+    username_str = f"@{author_info.username}" if author_info and author_info.username else "No Username"
+
+    header = (
+        f"👤 <b>User History:</b> {html.escape(author_name)} ({html.escape(username_str)})\n"
+        f"🆔 <b>User ID:</b> <code>{html.escape(user_id_str)}</code>\n"
+        f"📊 <b>Matching Comments Found:</b> <b>{len(comments)}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+
+    # Render up to 5 items directly in chat
+    body_items = []
+    for idx, c in enumerate(comments[:5], 1):
+        link_str = f' (<a href="{c["url"]}">Jump to Msg</a>)' if c.get("url") else ""
+        item_text = (
+            f"<b>{idx}. [{html.escape(c['source'] or 'Group')}]</b>{link_str}\n"
+            f"🕒 <i>{c['published_at']}</i> | 🔥 <b>Severity:</b> {c['severity_score']}/10\n"
+            f"<blockquote>{html.escape(c['text'][:300])}{'...' if len(c['text']) > 300 else ''}</blockquote>\n"
+        )
+        body_items.append(item_text)
+
+    footer = ""
+    if len(comments) > 5:
+        footer = f"\n<i>...and {len(comments) - 5} more comments included in attached report file below.</i>"
+
+    await progress_msg.edit_text(header + "\n".join(body_items) + footer, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+    # If >5 comments, also send full HTML report as a file
+    if len(comments) > 5:
+        html_content = generate_html_report(author_name, user_id_str, filter_mode, comments)
+        file_bytes = html_content.encode("utf-8")
+        filename = f"user_history_{clean_filename(target_input)}_{filter_mode}.html"
+        await message.answer_document(
+            document=BufferedInputFile(file_bytes, filename=filename),
+            caption=f"📄 Full history report for <b>{html.escape(author_name)}</b> ({len(comments)} comments)",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+def clean_filename(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", s)
+
+
+@router.callback_query(F.data.startswith("userhist:"))
+async def cb_user_history(callback: CallbackQuery):
+    """Inline button handler from alert messages to jump directly to user history."""
+    parts = callback.data.split(":")
+    if len(parts) >= 3:
+        platform = parts[1]
+        user_id = parts[2]
+        if platform == "telegram":
+            # Simulate lookup
+            await callback.answer("Running user history lookup...")
+            # Send lookup command simulation
+            mock_message = callback.message
+            mock_message.text = f"/lookup {user_id} negative"
+            await cmd_lookup_user(mock_message)
+        else:
+            async with async_session_factory() as session:
+                c_repo = CommentRepository(session)
+                comments = await c_repo.get_user_comments(platform, user_id, only_negative=True, limit=10)
+            await callback.answer(f"Found {len(comments)} previous flagged comments for user in DB.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("fp:"))
+async def cb_mark_false_positive(callback: CallbackQuery):
+    """Mark a flagged comment as a false positive."""
+    comment_id = callback.data.split("fp:")[-1]
+    async with async_session_factory() as session:
+        c_repo = CommentRepository(session)
+        await c_repo.update_llm_verdict(
+            comment_id=comment_id,
+            is_on_topic=False,
+            is_severely_negative=False,
+            severity_score=0,
+            llm_reason="Marked as False Positive by Operator",
+            llm_status="false_positive",
+        )
+        await session.commit()
+    await callback.answer("Marked as False Positive ✅")
+    await callback.message.edit_reply_markup(reply_markup=None)
