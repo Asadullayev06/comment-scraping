@@ -83,6 +83,17 @@ def generate_html_report(author_name: str, user_id: str, mode: str, comments: Li
 </html>"""
 
 
+@router.message(F.text == "🔍 User Lookup")
+async def btn_user_lookup(message: Message):
+    await message.reply(
+        "🔍 <b>To search a user's comment history across mutual groups, send:</b>\n\n"
+        "• <code>/lookup @username all</code> — Return all comments from mutual groups\n"
+        "• <code>/lookup @username negative</code> — Return only severely negative comments\n"
+        "• <code>/lookup 123456789 negative</code> — Search by numeric Telegram ID",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @router.message(Command("lookup"))
 async def cmd_lookup_user(message: Message):
     """Deep scan across mutual groups for a specific Telegram @username or numeric ID."""

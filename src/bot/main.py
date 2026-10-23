@@ -66,6 +66,21 @@ async def start_bot(mtproto_collector=None):
     # Launch background alert delivery worker
     alert_task = asyncio.create_task(background_alert_worker(bot, dispatcher))
 
+    # Register bot menu commands in Telegram UI
+    try:
+        from aiogram.types import BotCommand
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Dashboard & Main Menu"),
+            BotCommand(command="targets", description="Monitored Targets"),
+            BotCommand(command="add_target", description="Add Monitored URL / Handle"),
+            BotCommand(command="lookup", description="Search User in Mutual Groups"),
+            BotCommand(command="stats", description="Ingestion & AI Metrics"),
+            BotCommand(command="threshold", description="Set Alert Severity Threshold"),
+            BotCommand(command="help", description="Help & Documentation"),
+        ])
+    except Exception as cmd_err:
+        logger.warning("Could not register bot commands menu", error=str(cmd_err))
+
     logger.info("Starting Aiogram 3 Bot polling...")
     try:
         await dp.start_polling(bot)

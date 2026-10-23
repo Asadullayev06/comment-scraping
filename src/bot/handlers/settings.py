@@ -1,7 +1,7 @@
 """Dashboard, statistics, and threshold settings handlers for Aiogram 3."""
 
-from aiogram import Router
-from aiogram.types import Message
+from aiogram import Router, F
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from src.config import settings
@@ -12,10 +12,33 @@ from src.db.repositories.comment_repo import CommentRepository
 router = Router(name="settings_router")
 
 
+def get_main_keyboard() -> ReplyKeyboardMarkup:
+    """Persistent bottom keyboard menu for instant one-tap control."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="🎯 Monitored Targets"),
+                KeyboardButton(text="➕ Add Target"),
+            ],
+            [
+                KeyboardButton(text="🔍 User Lookup"),
+                KeyboardButton(text="📊 Statistics"),
+            ],
+            [
+                KeyboardButton(text="⚙️ Threshold"),
+                KeyboardButton(text="ℹ️ Help"),
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 @router.message(Command("start"))
 @router.message(Command("help"))
+@router.message(F.text == "ℹ️ Help")
 async def cmd_start_help(message: Message):
-    """Show operational dashboard and help documentation."""
+    """Show operational dashboard and help documentation with reply keyboard."""
     async with async_session_factory() as session:
         t_repo = TargetRepository(session)
         c_repo = CommentRepository(session)
@@ -38,12 +61,13 @@ async def cmd_start_help(message: Message):
         "• <code>/stats</code> — Detailed ingestion and AI metrics\n"
         "• <code>/threshold &lt;1-10&gt;</code> — Set minimum severity score for alerts (default: 7)\n"
         "• <code>/help</code> — Show this guide\n\n"
-        "<i>All alerts are automatically delivered to authorized administrators in real time.</i>"
+        "<i>Use the buttons below for quick navigation.</i>"
     )
-    await message.reply(text, parse_mode=ParseMode.HTML)
+    await message.reply(text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 
 @router.message(Command("stats"))
+@router.message(F.text == "📊 Statistics")
 async def cmd_stats(message: Message):
     """Display comprehensive system metrics."""
     async with async_session_factory() as session:
@@ -76,6 +100,7 @@ async def cmd_stats(message: Message):
 
 
 @router.message(Command("threshold"))
+@router.message(F.text == "⚙️ Threshold")
 async def cmd_set_threshold(message: Message):
     """Change the alert severity threshold dynamically."""
     args = message.text.split()

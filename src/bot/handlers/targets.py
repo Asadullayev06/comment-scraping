@@ -118,7 +118,21 @@ async def cmd_add_target(message: Message):
     )
 
 
+@router.message(F.text == "➕ Add Target")
+async def btn_add_target(message: Message):
+    await message.reply(
+        "➕ <b>To add a target, send <code>/add_target &lt;link_or_username&gt;</code>:</b>\n\n"
+        "• <b>Telegram:</b> <code>/add_target @channel_username</code>\n"
+        "• <b>Instagram:</b> <code>/add_target https://www.instagram.com/p/POST_ID/</code>\n"
+        "• <b>YouTube:</b> <code>/add_target https://www.youtube.com/watch?v=VIDEO_ID</code>\n"
+        "• <b>X (Twitter):</b> <code>/add_target https://x.com/user/status/POST_ID</code>\n"
+        "• <b>Facebook:</b> <code>/add_target https://www.facebook.com/posts/POST_ID</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @router.message(Command("targets"))
+@router.message(F.text == "🎯 Monitored Targets")
 async def cmd_list_targets(message: Message):
     """List all registered targets with interactive management buttons."""
     async with async_session_factory() as session:
