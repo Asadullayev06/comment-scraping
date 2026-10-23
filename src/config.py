@@ -49,13 +49,31 @@ class Settings(BaseSettings):
     @field_validator("ADMIN_TELEGRAM_IDS", mode="before")
     @classmethod
     def parse_admin_ids(cls, v):
-        if isinstance(v, str):
-            if not v.strip():
-                return []
-            return [int(x.strip()) for x in v.split(",") if x.strip()]
+        if v is None or v == "":
+            return []
+        if isinstance(v, int):
+            return [v]
         if isinstance(v, (list, tuple, set)):
             return [int(x) for x in v]
-        return v
+        if isinstance(v, str):
+            clean = v.strip().strip("[]()")
+            if not clean:
+                return []
+            return [int(x.strip().strip("'\"")) for x in clean.split(",") if x.strip()]
+        try:
+            return [int(v)]
+        except Exception:
+            return []
+
+    @field_validator("TELEGRAM_API_ID", mode="before")
+    @classmethod
+    def parse_api_id(cls, v):
+        if v is None or v == "" or (isinstance(v, str) and not v.strip()):
+            return 0
+        try:
+            return int(v)
+        except Exception:
+            return 0
 
     def is_admin(self, user_id: int) -> bool:
         """Check if a Telegram user ID is authorized as an administrator."""
