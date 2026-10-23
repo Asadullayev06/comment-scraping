@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-operatives}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-strongpassword}
+      POSTGRES_DB: ${POSTGRES_DB:-operatives_db}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U operatives -d operatives_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Aiogram 3 Bot Controller & Real-Time Alert Dispatcher
+  bot-controller:
+    build: .
+    restart: unless-stopped
+    command: python src/main.py
+    environment:
+      - ADMIN_TELEGRAM_IDS=${ADMIN_TELEGRAM_IDS}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_SESSION_NAME=monitor_userbot
+      - TELEGRAM_SESSION_STRING=${TELEGRAM_SESSION_STRING}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - LLM_BATCH_SIZE=${LLM_BATCH_SIZE:-40}
+      - LLM_BATCH_FLUSH_SECONDS=${LLM_BATCH_FLUSH_SECONDS:-4.0}
+      - LLM_ALERT_SEVERITY_THRESHOLD=${LLM_ALERT_SEVERITY_THRESHOLD:-7}
+      - DATABASE_URL=postgresql+asyncpg://operatives:strongpassword@postgres:5432/operatives_db
+      - REDIS_URL=redis://redis:6379/0
+      - SESSION_ENCRYPTION_KEY=${SESSION_ENCRYPTION_KEY}
+    volumes:
+      - telethon_sessions:/app/sessions
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Arq Background Worker (External Social Scrapers & Periodic LLM Batch Flush)
+  worker:
+    build: .
+    restart: unless-stopped
+    command: python -m arq src.workers.worker_settings.WorkerSettings
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - DATABASE_URL=postgresql+asyncpg://operatives:strongpassword@postgres:5432/operatives_db
+      - REDIS_URL=redis://redis:6379/0
+      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY}
+      - SESSION_ENCRYPTION_KEY=${SESSION_ENCRYPTION_KEY}
+    shm_size: '2gb'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pg_data:
+  redis_data:
+  telethon_sessions:
