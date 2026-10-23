@@ -202,3 +202,67 @@ async def cb_delete_target(callback: CallbackQuery):
         await session.commit()
     await callback.answer("Target deleted.")
     await callback.message.delete()
+
+
+@router.message(F.forward_from_chat)
+async def handle_forwarded_group_message(message: Message):
+    """Automatically detect private group/channel from any forwarded message."""
+    import html
+    chat = message.forward_from_chat
+    chat_id = str(chat.id)
+    chat_title = chat.title or chat.username or f"Private Chat {chat_id}"
+    clean_url = f"https://t.me/{chat.username}" if chat.username else None
+
+    # Sanitize callback data (max 64 bytes)
+    callback_data = f"fwd_add:{chat_id}"
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Add to Monitored Targets",
+                    callback_data=callback_data,
+                )
+            ]
+        ]
+    )
+
+    await message.reply(
+        f"🎯 <b>Detected Group from Forwarded Message!</b>\n\n"
+        f"📢 <b>Title:</b> {html.escape(chat_title)}\n"
+        f"🆔 <b>Numeric Chat ID:</b> <code>{chat_id}</code>\n"
+        f"🌐 <b>Chat Type:</b> <code>{chat.type}</code>\n\n"
+        f"Click the button below to start monitoring this group:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("fwd_add:"))
+async def cb_add_forwarded_target(callback: CallbackQuery):
+    """One-click add target from forwarded message button."""
+    chat_id = callback.data.split("fwd_add:")[-1]
+    title = "Monitored Private Group"
+    if callback.message and callback.message.text:
+        # Extract title from text if present
+        for line in callback.message.text.splitlines():
+            if "Title:" in line:
+                title = line.replace("Title:", "").strip()
+
+    async with async_session_factory() as session:
+        repo = TargetRepository(session)
+        target = await repo.create_or_activate(
+            platform="telegram",
+            target_type="telegram_chat",
+            external_id=chat_id,
+            url=None,
+            title_or_name=title,
+        )
+        await session.commit()
+
+    await callback.answer("Target added and activated! ✅")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.reply(
+        f"✅ <b>Successfully added '{title}' (ID: <code>{chat_id}</code>) to monitored targets!</b>",
+        parse_mode=ParseMode.HTML,
+    )
