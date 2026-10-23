@@ -3,6 +3,7 @@
 import asyncio
 from typing import Any, Dict
 import structlog
+from arq import cron
 from arq.connections import RedisSettings
 import redis.asyncio as aioredis
 from src.config import settings
@@ -135,8 +136,8 @@ class WorkerSettings:
     on_shutdown = shutdown
     cron_jobs = [
         # Run LLM buffer flush every 5 seconds
-        {"func": process_llm_queue_cron, "second": {0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}},
+        cron(process_llm_queue_cron, second={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}),
         # Run external targets check every 5 minutes
-        {"func": poll_active_targets_cron, "minute": {0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}},
+        cron(poll_active_targets_cron, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}),
     ]
     redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
