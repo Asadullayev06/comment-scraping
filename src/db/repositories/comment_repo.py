@@ -180,9 +180,15 @@ class CommentRepository:
         alerts_sent_stmt = select(func.count(Comment.id)).where(Comment.alert_sent.is_(True))
         alerts_sent = (await self.session.execute(alerts_sent_stmt)).scalar() or 0
 
+        # Query actual comments grouped by platform
+        platform_stmt = select(Comment.platform, func.count(Comment.id)).group_by(Comment.platform)
+        platform_rows = (await self.session.execute(platform_stmt)).all()
+        by_platform = {row[0]: row[1] for row in platform_rows}
+
         return {
             "total_comments": total,
             "pending_evaluation": pending,
             "severely_negative_flagged": flagged,
             "alerts_dispatched": alerts_sent,
+            "by_platform": by_platform,
         }

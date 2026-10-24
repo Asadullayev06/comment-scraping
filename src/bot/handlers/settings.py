@@ -109,11 +109,8 @@ async def cmd_stats(message: Message, state: FSMContext):
         stats = await c_repo.get_stats()
         targets = await t_repo.list_all()
 
-    breakdown = {}
-    for t in targets:
-        breakdown[t.platform] = breakdown.get(t.platform, 0) + t.total_comments_collected
-
-    platform_lines = [f"  • {p.capitalize()}: <code>{count}</code>" for p, count in breakdown.items()]
+    breakdown = stats.get("by_platform", {})
+    platform_lines = [f"  • {p.capitalize()}: <code>{count}</code>" for p, count in sorted(breakdown.items())]
     platform_str = "\n".join(platform_lines) if platform_lines else "  • No data yet"
 
     text = (
