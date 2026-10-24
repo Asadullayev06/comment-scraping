@@ -255,6 +255,7 @@ async def cmd_list_targets(message: Message, state: FSMContext):
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
+                    InlineKeyboardButton(text="🔄 Scrape Now", callback_data=f"tgt:scrape:{t.id}"),
                     InlineKeyboardButton(text=toggle_label, callback_data=f"tgt:toggle:{t.id}"),
                     InlineKeyboardButton(text="🗑 Delete", callback_data=f"tgt:del:{t.id}"),
                 ]
@@ -267,6 +268,22 @@ async def cmd_list_targets(message: Message, state: FSMContext):
             f"🔗 <b>Link:</b> {t.url or 'N/A'}"
         )
         await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
+
+
+@router.callback_query(F.data.startswith("tgt:scrape:"))
+async def cb_scrape_target(callback: CallbackQuery):
+    """Manually trigger immediate scrape job for a target."""
+    target_id = callback.data.split("tgt:scrape:")[-1]
+    try:
+        from arq import create_pool
+        from arq.connections import RedisSettings
+        from src.config import settings
+        pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+        await pool.enqueue_job("scrape_target_job", target_id)
+        await pool.aclose()
+        await callback.answer("🔄 Scrape job triggered! Comments are being ingested...", show_alert=True)
+    except Exception as e:
+        await callback.answer(f"Failed to trigger: {str(e)[:50]}", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("tgt:toggle:"))

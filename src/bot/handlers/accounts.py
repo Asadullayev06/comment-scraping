@@ -54,13 +54,36 @@ async def cmd_add_session(message: Message):
         )
         await db_session.commit()
 
+    # Auto-trigger scrape for any active targets on this platform
+    enqueued_count = 0
+    try:
+        from arq import create_pool
+        from arq.connections import RedisSettings
+        from src.config import settings
+        from src.db.repositories.target_repo import TargetRepository
+
+        async with async_session_factory() as t_sess:
+            t_repo = TargetRepository(t_sess)
+            active_targets = await t_repo.get_active_targets(platform=platform)
+
+        if active_targets:
+            pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+            for target in active_targets:
+                await pool.enqueue_job("scrape_target_job", target.id)
+                enqueued_count += 1
+            await pool.aclose()
+    except Exception as q_err:
+        logger.debug("Could not auto-enqueue scrape on session add", error=str(q_err))
+
+    extra_msg = f"\n\n🚀 <i>Immediately triggered scraping for {enqueued_count} active {platform.capitalize()} target(s)!</i>" if enqueued_count > 0 else ""
+
     await message.reply(
         f"✅ <b>Burner Session Stored & Encrypted!</b>\n\n"
         f"🌐 <b>Platform:</b> {platform.capitalize()}\n"
         f"👤 <b>Account:</b> <code>{html.escape(identifier)}</code>\n"
         f"🛡️ <b>Status:</b> Active\n"
         f"🔌 <b>Proxy:</b> {html.escape(proxy) if proxy else 'Direct connection'}\n\n"
-        f"<i>The scraper worker will now use this account to paginate comments.</i>",
+        f"<i>The scraper worker will now use this account to paginate comments.{extra_msg}</i>",
         parse_mode=ParseMode.HTML,
     )
 
