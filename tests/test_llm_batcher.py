@@ -24,12 +24,20 @@ def test_is_trivial_comment():
     assert is_trivial_comment("  ") is True
     assert is_trivial_comment("👍") is True
     assert is_trivial_comment("😂😂🔥") is True
+    assert is_trivial_comment(")))") is True
+    assert is_trivial_comment(":-)))") is True
+    assert is_trivial_comment(":D") is True
     assert is_trivial_comment("ok") is True
     assert is_trivial_comment("@user") is True
     assert is_trivial_comment("https://example.com") is True
     
-    # Substantive comments must NOT be trivial
-    assert is_trivial_comment("Bu qanun tamamilə haqsızdır!") is False
+    # Short 1-3 word casual comments should be ignored
+    assert is_trivial_comment("zor gap yoq") is True
+    assert is_trivial_comment("raxmat aka") is True
+    assert is_trivial_comment("ha shunday boladi") is True
+    
+    # Substantive comments (>3 words) must NOT be trivial
+    assert is_trivial_comment("Bu yangi jarima qonuni xalqni talash uchundir!") is False
     assert is_trivial_comment("These new tax rules are completely absurd and oppressive.") is False
 
 

@@ -115,38 +115,6 @@ class YouTubeCollector(BaseCollector):
                 )
                 total_yielded += 1
 
-                # Include replies if present
-                replies = item.get("replies", {}).get("comments", [])
-                for reply in replies:
-                    r_snip = reply.get("snippet", {})
-                    r_id = reply.get("id")
-                    r_author = r_snip.get("authorChannelId", {}).get("value", "unknown")
-                    r_name = r_snip.get("authorDisplayName")
-                    r_text = r_snip.get("textDisplay", "")
-                    r_pub = r_snip.get("publishedAt")
-                    r_dt = None
-                    if r_pub:
-                        try:
-                            r_dt = datetime.fromisoformat(r_pub.replace("Z", "+00:00"))
-                        except Exception:
-                            r_dt = datetime.now(timezone.utc)
-
-                    yield NormalizedComment(
-                        platform="youtube",
-                        external_comment_id=f"yt_{r_id}",
-                        parent_external_id=comment_id,
-                        target_external_id=video_id,
-                        source_name=target.title_or_name or f"YouTube Video {video_id}",
-                        post_url=f"https://www.youtube.com/watch?v={video_id}",
-                        comment_url=build_youtube_comment_url(video_id, r_id),
-                        author_external_id=r_author,
-                        author_username=r_name,
-                        author_display_name=r_name,
-                        content_text=r_text,
-                        published_at=r_dt,
-                    )
-                    total_yielded += 1
-
             page_token = data.get("nextPageToken")
             if not page_token:
                 break

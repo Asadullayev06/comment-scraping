@@ -150,49 +150,6 @@ class InstagramCollector(BaseCollector):
                     )
                     total_yielded += 1
 
-                    # 3. Reply Fetching: Extract child replies if thread has replies
-                    if child_count > 0:
-                        try:
-                            # Add minor jitter before fetching child comments
-                            await asyncio.sleep(random.uniform(0.5, 1.2))
-                            replies = await asyncio.to_thread(
-                                cl.media_comment_replies,
-                                media_id,
-                                c.pk,
-                                amount=100,
-                            )
-                            for reply in replies:
-                                r_pk = str(reply.pk)
-                                r_user = getattr(reply, "user", None)
-                                r_uname = getattr(r_user, "username", None)
-                                r_fname = getattr(r_user, "full_name", None)
-                                r_user_pk = str(getattr(r_user, "pk", "unknown"))
-                                r_text = getattr(reply, "text", "")
-                                r_created = getattr(reply, "created_at_utc", None)
-                                if isinstance(r_created, (int, float)):
-                                    r_pub_dt = datetime.fromtimestamp(r_created, tz=timezone.utc)
-                                else:
-                                    r_pub_dt = r_created or datetime.now(timezone.utc)
-
-                                yield NormalizedComment(
-                                    platform="instagram",
-                                    external_comment_id=f"ig_{r_pk}",
-                                    parent_external_id=f"ig_{pk}",
-                                    child_comment_count=0,
-                                    target_external_id=shortcode,
-                                    source_name=f"Instagram Post @{username}" if username else "Instagram Post",
-                                    post_url=f"https://www.instagram.com/p/{shortcode}/",
-                                    comment_url=build_instagram_comment_url(shortcode, r_pk),
-                                    author_external_id=r_user_pk,
-                                    author_username=r_uname,
-                                    author_display_name=r_fname,
-                                    content_text=r_text,
-                                    published_at=r_pub_dt,
-                                )
-                                total_yielded += 1
-                        except Exception as reply_err:
-                            logger.debug("Could not fetch child replies for comment", parent_pk=pk, error=str(reply_err))
-
                 if not next_min_id or next_min_id == min_id:
                     break
                 min_id = next_min_id

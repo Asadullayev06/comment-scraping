@@ -16,24 +16,49 @@ from src.llm.client import DeepSeekClassifier
 logger = structlog.get_logger(__name__)
 
 # Regular expressions for zero-cost pre-filtering
-EMOJI_URL_MENTION_PATTERN = re.compile(
-    r"^(\s*|https?://\S+|@\w+|[\U00010000-\U0010ffff]|[\u2600-\u27bf]|[\ud83c-\ud83e][\ud000-\udfff])+$",
+EMOJI_PATTERN = re.compile(
+    r"[\U00010000-\U0010ffff]|[\u2600-\u27bf]|[\ud83c-\ud83e][\ud000-\udfff]",
     flags=re.UNICODE,
 )
+TEXT_SMILIKS_PATTERN = re.compile(r"^[\s\)\]\(\[:;DdxpP_~*!?.+\-]+$")
+TRIGGER_WORDS_SHORT = {
+    "istefa", "iste'fo", "otstavka", "отставка", "boycott", "boykot",
+    "etiraz", "protest", "inqilob", "revolyutsiya", "революция",
+}
 
 
 def is_trivial_comment(text: str) -> bool:
-    """Identify if a comment is trivial, emoji-only, or lacks substance before calling LLM."""
+    """Identify if a comment is trivial, emoji-only, smiliks, or short 1-3 words without substance."""
     if not text:
         return True
     cleaned = text.strip()
     if len(cleaned) < 3:
         return True
-    words = cleaned.split()
-    if len(words) < 2 and not any(len(w) > 7 for w in words):
+
+    # 1. Check if it's pure text smiliks like ))), (((, :D, :-), etc.
+    if TEXT_SMILIKS_PATTERN.match(cleaned):
         return True
-    if EMOJI_URL_MENTION_PATTERN.match(cleaned):
+
+    # 2. Strip URLs and @mentions
+    stripped = re.sub(r"https?://\S+|@\w+", "", cleaned).strip()
+    if not stripped:
         return True
+
+    # 3. Strip emojis
+    no_emoji = EMOJI_PATTERN.sub("", stripped).strip()
+    if not no_emoji or TEXT_SMILIKS_PATTERN.match(no_emoji):
+        return True
+
+    # 4. Count substantive alphanumeric words
+    words = [w for w in re.split(r"[\s,.-]+", no_emoji) if any(c.isalnum() for c in w)]
+
+    # Ignore short 1, 2, or 3-word comments (e.g. "zor gap yoq", "ha shunday", "yaxshi aka")
+    if len(words) <= 3:
+        # Only keep if an explicit direct hostile trigger word exists
+        has_trigger = any(w.lower() in TRIGGER_WORDS_SHORT for w in words)
+        if not has_trigger:
+            return True
+
     return False
 
 
