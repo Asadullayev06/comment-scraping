@@ -5,10 +5,12 @@ from typing import Optional, Tuple
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 from aiogram.enums import ParseMode
 import structlog
 from src.db.base import async_session_factory
 from src.db.repositories.target_repo import TargetRepository
+from src.bot.states import TargetStates
 
 logger = structlog.get_logger(__name__)
 router = Router(name="targets_router")
@@ -119,21 +121,75 @@ async def cmd_add_target(message: Message):
 
 
 @router.message(F.text == "➕ Add Target")
-async def btn_add_target(message: Message):
+async def btn_add_target(message: Message, state: FSMContext):
+    """Start interactive target addition without slash commands."""
+    await state.set_state(TargetStates.waiting_for_target_input)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_state")]]
+    )
     await message.reply(
-        "➕ <b>To add a target, send <code>/add_target &lt;link_or_username&gt;</code>:</b>\n\n"
-        "• <b>Telegram:</b> <code>/add_target @channel_username</code>\n"
-        "• <b>Instagram:</b> <code>/add_target https://www.instagram.com/p/POST_ID/</code>\n"
-        "• <b>YouTube:</b> <code>/add_target https://www.youtube.com/watch?v=VIDEO_ID</code>\n"
-        "• <b>X (Twitter):</b> <code>/add_target https://x.com/user/status/POST_ID</code>\n"
-        "• <b>Facebook:</b> <code>/add_target https://www.facebook.com/posts/POST_ID</code>",
+        "➕ <b>Add Monitored Target</b>\n\n"
+        "Send the link, @username, or numeric Chat ID below:\n\n"
+        "• <b>Telegram:</b> <code>@channel_name</code> or <code>-1001234567890</code>\n"
+        "• <b>Instagram:</b> <code>https://www.instagram.com/p/POST_ID/</code>\n"
+        "• <b>YouTube:</b> <code>https://www.youtube.com/watch?v=VIDEO_ID</code>\n"
+        "• <b>X (Twitter):</b> <code>https://x.com/user/status/POST_ID</code>\n"
+        "• <b>Facebook:</b> <code>https://www.facebook.com/posts/POST_ID</code>\n\n"
+        "<i>(Just paste the URL directly — no slash commands needed!)</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+@router.message(TargetStates.waiting_for_target_input)
+async def process_target_input(message: Message, state: FSMContext):
+    """Process direct URL/handle sent by user while in add target state."""
+    if not message.text:
+        return
+
+    raw_input = message.text.strip()
+    platform, target_type, external_id, clean_url = detect_platform_and_id(raw_input)
+
+    if not platform or not external_id:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_state")]]
+        )
+        await message.reply(
+            "❌ <b>Could not recognize platform from input.</b>\n\n"
+            "Please send a valid social media URL, @username, or numeric Chat ID:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return
+
+    await state.clear()
+    async with async_session_factory() as session:
+        repo = TargetRepository(session)
+        target = await repo.create_or_activate(
+            platform=platform,
+            target_type=target_type,
+            external_id=external_id,
+            url=clean_url,
+            title_or_name=f"{platform.capitalize()} Target: {external_id}",
+        )
+        await session.commit()
+
+    await message.reply(
+        f"✅ <b>Target Registered & Activated!</b>\n\n"
+        f"🌐 <b>Platform:</b> {platform.capitalize()}\n"
+        f"🎯 <b>Type:</b> <code>{target_type}</code>\n"
+        f"🆔 <b>Target ID:</b> <code>{external_id}</code>\n"
+        f"🔗 <b>URL:</b> {clean_url or 'N/A'}\n\n"
+        f"<i>Target is now monitored for new comments.</i>",
         parse_mode=ParseMode.HTML,
     )
 
 
 @router.message(Command("targets"))
 @router.message(F.text == "🎯 Monitored Targets")
-async def cmd_list_targets(message: Message):
+async def cmd_list_targets(message: Message, state: FSMContext):
+    """List all registered targets with interactive management buttons."""
+    await state.clear()
     """List all registered targets with interactive management buttons."""
     async with async_session_factory() as session:
         repo = TargetRepository(session)

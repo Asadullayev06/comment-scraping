@@ -1,15 +1,18 @@
-"""User History Lookup command handlers for Telegram deep scanning."""
+"""User History Lookup command handlers for Telegram deep scanning with interactive FSM support."""
 
+import re
 import html
 from typing import Optional, List, Dict, Any
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 from aiogram.enums import ParseMode
 import structlog
 from src.db.base import async_session_factory
 from src.db.repositories.author_repo import AuthorRepository
 from src.db.repositories.comment_repo import CommentRepository
+from src.bot.states import LookupStates
 
 logger = structlog.get_logger(__name__)
 router = Router(name="lookup_router")
@@ -21,6 +24,10 @@ _mtproto_collector = None
 def set_mtproto_collector_instance(collector):
     global _mtproto_collector
     _mtproto_collector = collector
+
+
+def clean_filename(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", s)
 
 
 def generate_html_report(author_name: str, user_id: str, mode: str, comments: List[Dict[str, Any]]) -> str:
@@ -83,38 +90,9 @@ def generate_html_report(author_name: str, user_id: str, mode: str, comments: Li
 </html>"""
 
 
-@router.message(F.text == "🔍 User Lookup")
-async def btn_user_lookup(message: Message):
-    await message.reply(
-        "🔍 <b>To search a user's comment history across mutual groups, send:</b>\n\n"
-        "• <code>/lookup @username all</code> — Return all comments from mutual groups\n"
-        "• <code>/lookup @username negative</code> — Return only severely negative comments\n"
-        "• <code>/lookup 123456789 negative</code> — Search by numeric Telegram ID",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@router.message(Command("lookup"))
-async def cmd_lookup_user(message: Message):
-    """Deep scan across mutual groups for a specific Telegram @username or numeric ID."""
-    args = message.text.split()
-    if len(args) < 2:
-        await message.reply(
-            "<b>Usage:</b> <code>/lookup &lt;@username_or_id&gt; [all|negative]</code>\n\n"
-            "<b>Examples:</b>\n"
-            "• <code>/lookup @johndoe all</code> — Return all comments from mutual groups\n"
-            "• <code>/lookup @johndoe negative</code> — Return only severely negative comments\n"
-            "• <code>/lookup 123456789 negative</code> — Search by numeric Telegram ID",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    target_input = args[1].strip()
-    filter_mode = "all"
-    if len(args) >= 3 and args[2].lower() in ["negative", "neg", "flagged"]:
-        filter_mode = "negative"
-
-    progress_msg = await message.reply(
+async def execute_lookup(reply_target: Message, target_input: str, filter_mode: str = "negative"):
+    """Core execution logic for searching user comment history across mutual groups."""
+    progress_msg = await reply_target.reply(
         f"🔎 <b>Searching mutual groups & channels for</b> <code>{html.escape(target_input)}</code>...\n"
         f"<i>Mode: {filter_mode.upper()}</i>",
         parse_mode=ParseMode.HTML,
@@ -210,15 +188,102 @@ async def cmd_lookup_user(message: Message):
         html_content = generate_html_report(author_name, user_id_str, filter_mode, comments)
         file_bytes = html_content.encode("utf-8")
         filename = f"user_history_{clean_filename(target_input)}_{filter_mode}.html"
-        await message.answer_document(
+        await reply_target.answer_document(
             document=BufferedInputFile(file_bytes, filename=filename),
             caption=f"📄 Full history report for <b>{html.escape(author_name)}</b> ({len(comments)} comments)",
             parse_mode=ParseMode.HTML,
         )
 
 
-def clean_filename(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_-]", "_", s)
+@router.message(F.text == "🔍 User Lookup")
+async def btn_user_lookup(message: Message, state: FSMContext):
+    """Start interactive lookup mode without typing slash commands."""
+    await state.set_state(LookupStates.waiting_for_user_input)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_state")]]
+    )
+    await message.reply(
+        "🔍 <b>Telegram User History Lookup</b>\n\n"
+        "Send the person's Telegram <b>@username</b> or numeric <b>User ID</b> below:\n\n"
+        "<i>Examples: <code>@D0nlyor</code> or <code>1140366830</code></i>\n"
+        "<i>(Just type the username or ID directly — no slash commands needed!)</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+@router.message(LookupStates.waiting_for_user_input)
+async def process_lookup_user_input(message: Message, state: FSMContext):
+    """Handle username or ID provided by user in lookup state."""
+    if not message.text:
+        return
+
+    text = message.text.strip()
+    parts = text.split()
+    target_input = parts[0]
+
+    # If user already typed mode like "@username negative" or "@username all"
+    if len(parts) >= 2 and parts[1].lower() in ["negative", "neg", "all"]:
+        filter_mode = "negative" if parts[1].lower() in ["negative", "neg"] else "all"
+        await state.clear()
+        await execute_lookup(message, target_input, filter_mode)
+        return
+
+    # Otherwise, present one-tap mode selection buttons!
+    await state.update_data(target_input=target_input)
+    await state.set_state(LookupStates.waiting_for_mode)
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🚨 Negative / Hostile Only", callback_data="lkp_mode:negative"),
+                InlineKeyboardButton(text="📜 All Comments", callback_data="lkp_mode:all"),
+            ],
+            [
+                InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_state"),
+            ],
+        ]
+    )
+    await message.reply(
+        f"👤 <b>Target Selected:</b> <code>{html.escape(target_input)}</code>\n\n"
+        f"Choose what comments to search for:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("lkp_mode:"))
+async def cb_execute_lookup_mode(callback: CallbackQuery, state: FSMContext):
+    """Execute search based on tapped mode button."""
+    mode = callback.data.split(":")[-1]
+    data = await state.get_data()
+    target_input = data.get("target_input")
+    await state.clear()
+
+    if not target_input:
+        await callback.answer("Session expired. Please tap '🔍 User Lookup' again.", show_alert=True)
+        return
+
+    await callback.answer(f"Searching mode: {mode.upper()}...")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await execute_lookup(callback.message, target_input, filter_mode=mode)
+
+
+@router.message(Command("lookup"))
+async def cmd_lookup_user(message: Message, state: FSMContext):
+    """Traditional /lookup command handler."""
+    await state.clear()
+    args = message.text.split()
+    if len(args) < 2:
+        await btn_user_lookup(message, state)
+        return
+
+    target_input = args[1].strip()
+    filter_mode = "all"
+    if len(args) >= 3 and args[2].lower() in ["negative", "neg", "flagged"]:
+        filter_mode = "negative"
+
+    await execute_lookup(message, target_input, filter_mode)
 
 
 @router.callback_query(F.data.startswith("userhist:"))
@@ -229,12 +294,8 @@ async def cb_user_history(callback: CallbackQuery):
         platform = parts[1]
         user_id = parts[2]
         if platform == "telegram":
-            # Simulate lookup
             await callback.answer("Running user history lookup...")
-            # Send lookup command simulation
-            mock_message = callback.message
-            mock_message.text = f"/lookup {user_id} negative"
-            await cmd_lookup_user(mock_message)
+            await execute_lookup(callback.message, user_id, filter_mode="negative")
         else:
             async with async_session_factory() as session:
                 c_repo = CommentRepository(session)
