@@ -274,6 +274,36 @@ async def cmd_list_targets(message: Message, state: FSMContext):
 async def cb_scrape_target(callback: CallbackQuery):
     """Manually trigger immediate scrape job for a target."""
     target_id = callback.data.split("tgt:scrape:")[-1]
+    
+    # Check if target exists and if session is required
+    async with async_session_factory() as session:
+        t_repo = TargetRepository(session)
+        target = await t_repo.get_by_id(target_id)
+        if not target:
+            await callback.answer("Target not found.", show_alert=True)
+            return
+
+        if target.platform in ["instagram", "x", "facebook"]:
+            from src.db.repositories.session_repo import SessionRepository
+            s_repo = SessionRepository(session)
+            healthy = await s_repo.get_healthy_session(target.platform)
+            if not healthy:
+                all_sessions = await s_repo.list_sessions(platform=target.platform)
+                if not all_sessions:
+                    await callback.answer(
+                        f"⚠️ No burner account found for {target.platform.capitalize()}!\n"
+                        f"Use /add_session {target.platform} <name> <sessionid> first.",
+                        show_alert=True,
+                    )
+                    return
+                else:
+                    await callback.answer(
+                        f"⚠️ Burner account for {target.platform.capitalize()} is cooling down.\n"
+                        f"Click /reset_cooldowns or wait a few minutes.",
+                        show_alert=True,
+                    )
+                    return
+
     try:
         from arq import create_pool
         from arq.connections import RedisSettings
@@ -281,7 +311,7 @@ async def cb_scrape_target(callback: CallbackQuery):
         pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
         await pool.enqueue_job("scrape_target_job", target_id)
         await pool.aclose()
-        await callback.answer("🔄 Scrape job triggered! Comments are being ingested...", show_alert=True)
+        await callback.answer("🔄 Scrape job enqueued! Ingesting comments...", show_alert=True)
     except Exception as e:
         await callback.answer(f"Failed to trigger: {str(e)[:50]}", show_alert=True)
 

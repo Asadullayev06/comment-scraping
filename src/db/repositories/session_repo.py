@@ -57,8 +57,23 @@ class SessionRepository:
         user_agent: Optional[str] = None,
         proxy_url: Optional[str] = None,
     ) -> ScraperSession:
-        """Encrypt and store a burner session."""
+        """Encrypt and store or update an existing burner session."""
         encrypted_cookies = self.encrypt_data(cookies)
+
+        stmt = select(ScraperSession).where(
+            ScraperSession.platform == platform,
+            ScraperSession.account_identifier == account_identifier,
+        )
+        existing = (await self.session.execute(stmt)).scalar_one_or_none()
+        if existing:
+            existing.cookies_encrypted = encrypted_cookies
+            existing.proxy_url = proxy_url
+            existing.user_agent = user_agent
+            existing.status = "active"
+            existing.cooldown_until = None
+            existing.error_count = 0
+            return existing
+
         session_obj = ScraperSession(
             platform=platform,
             account_identifier=account_identifier,
@@ -70,6 +85,17 @@ class SessionRepository:
         self.session.add(session_obj)
         await self.session.flush()
         return session_obj
+
+    async def reset_all_cooldowns(self, platform: Optional[str] = None) -> int:
+        """Reset cooldown and reactivate all sessions."""
+        stmt = (
+            update(ScraperSession)
+            .values(status="active", cooldown_until=None)
+        )
+        if platform:
+            stmt = stmt.where(ScraperSession.platform == platform)
+        res = await self.session.execute(stmt)
+        return res.rowcount
 
     async def mark_used(self, session_id: str) -> None:
         stmt = (

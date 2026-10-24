@@ -112,4 +112,31 @@ async def cmd_list_sessions(message: Message):
             f"  Proxy: {html.escape(s.proxy_url) if s.proxy_url else 'None'}"
         )
 
-    await message.reply("\n\n".join(lines), parse_mode=ParseMode.HTML)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Reset All Cooldowns", callback_data="sessions:reset_cooldowns")]
+        ]
+    )
+
+    await message.reply("\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "sessions:reset_cooldowns")
+async def cb_reset_cooldowns(callback: CallbackQuery):
+    """Reactivate all burner sessions and clear cooldowns."""
+    async with async_session_factory() as db_session:
+        repo = SessionRepository(db_session)
+        count = await repo.reset_all_cooldowns()
+        await db_session.commit()
+    await callback.answer(f"✅ Reset cooldown for {count} session(s)!", show_alert=True)
+    await callback.message.reply(f"🟢 <b>All burner account cooldowns have been cleared! ({count} session(s) active)</b>", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("reset_cooldowns"))
+async def cmd_reset_cooldowns(message: Message):
+    """Reactivate all burner sessions manually."""
+    async with async_session_factory() as db_session:
+        repo = SessionRepository(db_session)
+        count = await repo.reset_all_cooldowns()
+        await db_session.commit()
+    await message.reply(f"🟢 <b>All burner account cooldowns have been cleared! ({count} session(s) active)</b>", parse_mode=ParseMode.HTML)

@@ -48,6 +48,13 @@ async def scrape_target_job(ctx: Dict[str, Any], target_id: str) -> int:
         comment_repo = CommentRepository(session)
         newly_inserted = 0
 
+        logger.info(
+            "Scrape job starting",
+            target_id=target_id,
+            platform=target.platform,
+            external_id=target.external_id,
+        )
+
         try:
             async for norm_comment in collector.fetch_comments(target, cursor=target.last_cursor, limit=1000):
                 # Upsert author
@@ -80,6 +87,13 @@ async def scrape_target_job(ctx: Dict[str, Any], target_id: str) -> int:
             await t_repo.update_cursor(target.id, increment_comments=newly_inserted)
             await session.commit()
 
+            logger.info(
+                "Scrape job completed",
+                target_id=target_id,
+                platform=target.platform,
+                newly_inserted=newly_inserted,
+            )
+
             # Trigger micro-batch processing
             if newly_inserted > 0:
                 processor = MicroBatchProcessor()
@@ -88,7 +102,7 @@ async def scrape_target_job(ctx: Dict[str, Any], target_id: str) -> int:
 
             return newly_inserted
         except Exception as e:
-            logger.error("Scrape job failed", target_id=target_id, error=str(e))
+            logger.error("Scrape job failed", target_id=target_id, platform=target.platform, error=str(e))
             return 0
 
 
