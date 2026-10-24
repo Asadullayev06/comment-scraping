@@ -109,13 +109,38 @@ async def cmd_add_target(message: Message):
         )
         await session.commit()
 
+    # Enqueue immediate scrape job via Arq
+    if platform != "telegram":
+        try:
+            from arq import create_pool
+            from arq.connections import RedisSettings
+            from src.config import settings
+            pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+            await pool.enqueue_job("scrape_target_job", target.id)
+            await pool.aclose()
+        except Exception as q_err:
+            logger.debug("Could not enqueue immediate scrape job", error=str(q_err))
+
+    session_hint = ""
+    if platform in ["instagram", "x", "facebook"]:
+        async with async_session_factory() as s_sess:
+            from src.db.repositories.session_repo import SessionRepository
+            s_repo = SessionRepository(s_sess)
+            healthy = await s_repo.get_healthy_session(platform)
+            if not healthy:
+                session_hint = (
+                    f"\n\n⚠️ <i>Note: No active burner account found for {platform.capitalize()}.\n"
+                    f"To scrape comments without blocks, register a burner session with:</i>\n"
+                    f"<code>/add_session {platform} &lt;username&gt; &lt;sessionid&gt;</code>"
+                )
+
     await message.reply(
         f"✅ <b>Target Registered & Activated!</b>\n\n"
         f"🌐 <b>Platform:</b> {platform.capitalize()}\n"
         f"🎯 <b>Type:</b> <code>{target_type}</code>\n"
         f"🆔 <b>Target ID:</b> <code>{external_id}</code>\n"
         f"🔗 <b>URL:</b> {clean_url or 'N/A'}\n\n"
-        f"<i>Target is now monitored for new comments.</i>",
+        f"<i>Initial scrape job enqueued.{session_hint}</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -174,13 +199,38 @@ async def process_target_input(message: Message, state: FSMContext):
         )
         await session.commit()
 
+    # Enqueue immediate scrape job via Arq
+    if platform != "telegram":
+        try:
+            from arq import create_pool
+            from arq.connections import RedisSettings
+            from src.config import settings
+            pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+            await pool.enqueue_job("scrape_target_job", target.id)
+            await pool.aclose()
+        except Exception as q_err:
+            logger.debug("Could not enqueue immediate scrape job", error=str(q_err))
+
+    session_hint = ""
+    if platform in ["instagram", "x", "facebook"]:
+        async with async_session_factory() as s_sess:
+            from src.db.repositories.session_repo import SessionRepository
+            s_repo = SessionRepository(s_sess)
+            healthy = await s_repo.get_healthy_session(platform)
+            if not healthy:
+                session_hint = (
+                    f"\n\n⚠️ <i>Note: No active burner account found for {platform.capitalize()}.\n"
+                    f"To scrape comments without blocks, register a burner session with:</i>\n"
+                    f"<code>/add_session {platform} &lt;username&gt; &lt;sessionid&gt;</code>"
+                )
+
     await message.reply(
         f"✅ <b>Target Registered & Activated!</b>\n\n"
         f"🌐 <b>Platform:</b> {platform.capitalize()}\n"
         f"🎯 <b>Type:</b> <code>{target_type}</code>\n"
         f"🆔 <b>Target ID:</b> <code>{external_id}</code>\n"
         f"🔗 <b>URL:</b> {clean_url or 'N/A'}\n\n"
-        f"<i>Target is now monitored for new comments.</i>",
+        f"<i>Initial scrape job enqueued.{session_hint}</i>",
         parse_mode=ParseMode.HTML,
     )
 

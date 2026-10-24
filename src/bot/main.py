@@ -9,7 +9,7 @@ import redis.asyncio as aioredis
 from src.config import settings
 from src.bot.middlewares import AdminAuthMiddleware
 from src.bot.alert_dispatcher import AlertDispatcher
-from src.bot.handlers import targets, lookup, settings as bot_settings
+from src.bot.handlers import targets, lookup, settings as bot_settings, accounts
 from src.schemas.alert import AlertPayload
 
 logger = structlog.get_logger(__name__)
@@ -57,6 +57,7 @@ async def start_bot(mtproto_collector=None):
     dp.include_router(targets.router)
     dp.include_router(lookup.router)
     dp.include_router(bot_settings.router)
+    dp.include_router(accounts.router)
 
     if mtproto_collector:
         lookup.set_mtproto_collector_instance(mtproto_collector)
