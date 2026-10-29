@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     )
     REDIS_URL: str = Field(default="redis://redis:6379/0")
 
+    # Platform Dynamic Query Hashes / Doc IDs (Configurable without redeployment)
+    X_TWEET_DETAIL_QUERY_ID: str = Field(default="V94IR8nUKvgjwjd8uKnogg")
+    FB_COMET_DOC_ID: str = Field(default="5959580457497184")
+
     # Scraper & Worker Settings
     SCRAPER_CONCURRENCY: int = Field(default=5)
     SCRAPER_HEADLESS: bool = Field(default=True)

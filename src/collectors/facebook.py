@@ -5,6 +5,7 @@ from typing import AsyncIterator, Optional, Dict, Any
 from datetime import datetime, timezone
 import httpx
 import structlog
+from src.config import settings
 from src.collectors.base import BaseCollector
 from src.schemas.comment import NormalizedComment
 from src.db.models import MonitoredTarget
@@ -16,8 +17,13 @@ logger = structlog.get_logger(__name__)
 class FacebookCollector(BaseCollector):
     platform = "facebook"
 
-    def __init__(self, pool_manager: Optional[SessionPoolManager] = None):
+    def __init__(
+        self,
+        pool_manager: Optional[SessionPoolManager] = None,
+        doc_id: Optional[str] = None,
+    ):
         self.pool_manager = pool_manager
+        self.doc_id = doc_id or settings.FB_COMET_DOC_ID
 
     async def start(self) -> None:
         pass
@@ -62,7 +68,7 @@ class FacebookCollector(BaseCollector):
                     "cursor": current_cursor,
                 }
                 form_data = {
-                    "doc_id": "5959580457497184",
+                    "doc_id": self.doc_id,
                     "variables": json.dumps(variables),
                     "fb_dtsg": cookies.get("fb_dtsg", ""),
                 }

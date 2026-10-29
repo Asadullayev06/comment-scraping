@@ -5,6 +5,7 @@ from typing import AsyncIterator, Optional, Dict, Any
 from datetime import datetime, timezone
 import httpx
 import structlog
+from src.config import settings
 from src.collectors.base import BaseCollector
 from src.schemas.comment import NormalizedComment
 from src.db.models import MonitoredTarget
@@ -16,8 +17,13 @@ logger = structlog.get_logger(__name__)
 class TwitterXCollector(BaseCollector):
     platform = "x"
 
-    def __init__(self, pool_manager: Optional[SessionPoolManager] = None):
+    def __init__(
+        self,
+        pool_manager: Optional[SessionPoolManager] = None,
+        query_id: Optional[str] = None,
+    ):
         self.pool_manager = pool_manager
+        self.query_id = query_id or settings.X_TWEET_DETAIL_QUERY_ID
 
     async def start(self) -> None:
         pass
@@ -51,8 +57,11 @@ class TwitterXCollector(BaseCollector):
         headers = {
             "authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
             "x-csrf-token": cookies.get("ct0", ""),
-            "user-agent": session_obj.user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "x-twitter-active-user": "yes",
+            "x-twitter-client-language": "en",
+            "user-agent": session_obj.user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "content-type": "application/json",
+            "Referer": f"https://x.com/i/status/{tweet_id}",
         }
 
         async with httpx.AsyncClient(cookies=cookies, proxy=proxy_url, headers=headers, timeout=25.0) as client:
@@ -76,7 +85,7 @@ class TwitterXCollector(BaseCollector):
                     "features": json.dumps({"responsive_web_graphql_timeline_navigation_enabled": True}),
                 }
 
-                url = "https://x.com/i/api/graphql/V94IR8nUKvgjwjd8uKnogg/TweetDetail"
+                url = f"https://x.com/i/api/graphql/{self.query_id}/TweetDetail"
                 try:
                     resp = await client.get(url, params=params)
                     if resp.status_code == 429:

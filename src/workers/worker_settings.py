@@ -21,8 +21,12 @@ from src.llm.processor import MicroBatchProcessor
 logger = structlog.get_logger(__name__)
 
 
-async def scrape_target_job(ctx: Dict[str, Any], target_id: str) -> int:
-    """Execute comment scraping for an external post/target."""
+async def scrape_target_job(ctx: Dict[str, Any], target_id: str, is_backfill: bool = False) -> int:
+    """Execute comment scraping for an external post/target with incremental deduplication.
+
+    For routine monitoring (is_backfill=False), starts at cursor=None (top/newest)
+    and stops early once MAX_CONSECUTIVE_DUPLICATES (8) existing comments are reached.
+    """
     async with async_session_factory() as session:
         t_repo = TargetRepository(session)
         target = await t_repo.get_by_id(target_id)
@@ -47,16 +51,23 @@ async def scrape_target_job(ctx: Dict[str, Any], target_id: str) -> int:
         author_repo = AuthorRepository(session)
         comment_repo = CommentRepository(session)
         newly_inserted = 0
+        consecutive_duplicates = 0
+        MAX_CONSECUTIVE_DUPLICATES = 8
+
+        # If backfilling, use target.last_cursor; otherwise start from top (None)
+        start_cursor = target.last_cursor if is_backfill else None
 
         logger.info(
             "Scrape job starting",
             target_id=target_id,
             platform=target.platform,
             external_id=target.external_id,
+            is_backfill=is_backfill,
+            start_cursor=bool(start_cursor),
         )
 
         try:
-            async for norm_comment in collector.fetch_comments(target, cursor=target.last_cursor, limit=1000):
+            async for norm_comment in collector.fetch_comments(target, cursor=start_cursor, limit=1000):
                 # Upsert author
                 author = await author_repo.upsert_author(
                     platform=norm_comment.platform,
@@ -66,7 +77,7 @@ async def scrape_target_job(ctx: Dict[str, Any], target_id: str) -> int:
                     profile_url=norm_comment.author_profile_url,
                 )
 
-                # Ingest comment
+                # Ingest comment (returns Comment if inserted, None if duplicate)
                 comment = await comment_repo.insert_single(
                     platform=norm_comment.platform,
                     external_comment_id=norm_comment.external_comment_id,
@@ -80,10 +91,23 @@ async def scrape_target_job(ctx: Dict[str, Any], target_id: str) -> int:
                     published_at=norm_comment.published_at,
                     child_comment_count=norm_comment.child_comment_count,
                 )
+
                 if comment:
                     newly_inserted += 1
+                    consecutive_duplicates = 0
+                else:
+                    consecutive_duplicates += 1
+                    # Stop early if we hit consecutive existing comments on a monitoring run
+                    if not is_backfill and consecutive_duplicates >= MAX_CONSECUTIVE_DUPLICATES:
+                        logger.info(
+                            "Early stopping reached: existing comment history encountered",
+                            target_id=target_id,
+                            platform=target.platform,
+                            consecutive_duplicates=consecutive_duplicates,
+                        )
+                        break
 
-            # Update target statistics
+            # Update target statistics without corrupting the top-of-feed monitoring state
             await t_repo.update_cursor(target.id, increment_comments=newly_inserted)
             await session.commit()
 
