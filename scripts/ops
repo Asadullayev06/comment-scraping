@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+ops - Standalone Zero-Dependency CLI for Hermes Agent
+Communicates with the Operatives comment-scraping internal bridge API
+and prints compact, token-safe JSON summaries (< 3 KB) to stdout.
+
+Install inside hermes-agent container:
+    cp ops /usr/local/bin/ops && chmod +x /usr/local/bin/ops
+
+Environment Variables (optional):
+    OPS_API_URL  (default: auto-discovers http://operatives-bridge:8080 or http://172.17.0.1:8080)
+    OPS_API_KEY  (optional API key if configured on the bridge)
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CANDIDATE_URLS = [
+    "http://operatives-bridge:8080",
+    "http://172.17.0.1:8080",
+    "http://host.docker.internal:8080",
+    "http://bot-controller:8080",
+    "http://127.0.0.1:8080",
+]
+
+
+def resolve_base_url() -> str:
+    env_url = os.environ.get("OPS_API_URL", "").strip().rstrip("/")
+    if env_url:
+        return env_url
+    for candidate in CANDIDATE_URLS:
+        try:
+            req = urllib.request.Request(f"{candidate}/health", method="GET")
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                if resp.status == 200:
+                    return candidate
+        except Exception:
+            continue
+    return CANDIDATE_URLS[0]
+
+
+def api_request(path: str, method: str = "GET", params: dict = None, body: dict = None, timeout: int = 90) -> dict:
+    base_url = resolve_base_url()
+    url = f"{base_url}{path}"
+    if params:
+        clean_params = {k: v for k, v in params.items() if v is not None and v != ""}
+        if clean_params:
+            url += "?" + urllib.parse.urlencode(clean_params)
+
+    headers = {"Accept": "application/json"}
+    api_key = os.environ.get("OPS_API_KEY", "").strip()
+    if api_key:
+        headers["X-API-Key"] = api_key
+
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            err_body = {"error": f"HTTP {e.code}: {e.reason}"}
+        return err_body
+    except Exception as e:
+        return {
+            "error": f"Failed to reach comment-scraping bridge at {base_url}: {e}",
+            "hint": "Set OPS_API_URL=http://<bridge-host>:8080 or ensure containers share the coolify network.",
+        }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ops",
+        description=(
+            "Operatives Intelligence CLI for Hermes Agent. "
+            "Queries PostgreSQL & triggers social scrapers (Telegram, Instagram, YouTube, X, Facebook), "
+            "returning compact pre-digested JSON (< 3 KB)."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # 1. ops digest
+    p_digest = sub.add_parser(
+        "digest",
+        help="Summarize activity and flagged hostile comments over the last N hours.",
+    )
+    p_digest.add_argument("--hours", type=int, default=24, help="Lookback window in hours (default: 24)")
+    p_digest.add_argument(
+        "--platform",
+        type=str,
+        default="",
+        help="Filter by platform: telegram, instagram, youtube, x, facebook",
+    )
+    p_digest.add_argument("--min-score", type=int, default=7, help="Minimum severity score 0-10 (default: 7)")
+    p_digest.add_argument("--limit", type=int, default=12, help="Max flagged comments to return (default: 12)")
+
+    # 2. ops check
+    p_check = sub.add_parser(
+        "check",
+        help="Inspect a monitored post/channel by ID, @handle, or URL (omit target to list all targets).",
+    )
+    p_check.add_argument(
+        "target",
+        nargs="?",
+        default="list",
+        help="Target UUID, shortcode, @channel, or URL (default: 'list' all monitored targets)",
+    )
+    p_check.add_argument("--limit", type=int, default=10, help="Max flagged comments to include (default: 10)")
+
+    # 3. ops scrape
+    p_scrape = sub.add_parser(
+        "scrape",
+        help="Add/trigger an immediate scrape + DeepSeek batch evaluation for a URL or @channel.",
+    )
+    p_scrape.add_argument("url", type=str, help="Full post URL (Instagram/YouTube/X/FB) or Telegram @channel")
+    p_scrape.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Enqueue background job and return immediately instead of waiting for LLM evaluation",
+    )
+    p_scrape.add_argument("--limit", type=int, default=200, help="Max comments to scrape (default: 200)")
+
+    # 4. ops search
+    p_search = sub.add_parser(
+        "search",
+        help="Search stored comments in PostgreSQL by keyword/phrase across platforms.",
+    )
+    p_search.add_argument("query", type=str, help="Keyword or phrase to search")
+    p_search.add_argument("--platform", type=str, default="", help="Optional platform filter")
+    p_search.add_argument("--min-score", type=int, default=0, help="Optional minimum severity score (default: 0)")
+    p_search.add_argument("--limit", type=int, default=12, help="Max matching comments to return (default: 12)")
+
+    # 5. ops sessions
+    p_sessions = sub.add_parser(
+        "sessions",
+        help="Check burner account health, active/cooldown status, and optionally reset cooldowns.",
+    )
+    p_sessions.add_argument("--platform", type=str, default="", help="Optional platform filter")
+    p_sessions.add_argument("--reset", action="store_true", help="Reset all cooldown timers and reactivate accounts")
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "digest":
+        res = api_request(
+            "/api/digest",
+            params={
+                "hours": args.hours,
+                "platform": args.platform,
+                "min_score": args.min_score,
+                "limit": args.limit,
+            },
+        )
+    elif args.command == "check":
+        res = api_request(
+            "/api/check",
+            params={"target": args.target, "limit": args.limit},
+        )
+    elif args.command == "scrape":
+        res = api_request(
+            "/api/scrape",
+            method="POST",
+            body={
+                "url": args.url,
+                "wait": not args.no_wait,
+                "limit": args.limit,
+            },
+            timeout=180,
+        )
+    elif args.command == "search":
+        res = api_request(
+            "/api/search",
+            params={
+                "q": args.query,
+                "platform": args.platform,
+                "min_score": args.min_score,
+                "limit": args.limit,
+            },
+        )
+    elif args.command == "sessions":
+        res = api_request(
+            "/api/sessions",
+            params={
+                "platform": args.platform,
+                "reset": "true" if args.reset else "false",
+            },
+        )
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

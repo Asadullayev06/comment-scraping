@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     SCRAPER_CONCURRENCY: int = Field(default=5)
     SCRAPER_HEADLESS: bool = Field(default=True)
 
+    # Internal Hermes Bridge API Settings
+    OPS_API_HOST: str = Field(default="0.0.0.0")
+    OPS_API_PORT: int = Field(default=8080)
+    OPS_API_KEY: Optional[str] = Field(default=None)
+
     @field_validator("ADMIN_TELEGRAM_IDS", mode="before")
     @classmethod
     def parse_admin_ids(cls, v):

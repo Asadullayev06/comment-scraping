@@ -284,10 +284,21 @@ class TelegramMTProtoCollector(BaseCollector):
 
         try:
             entity = await self.client.get_entity(int(target.external_id) if target.external_id.lstrip("-").isdigit() else target.external_id)
+            chat_to_iter = entity
+            if getattr(entity, "broadcast", False):
+                try:
+                    full = await self.client(functions.channels.GetFullChannelRequest(channel=entity))
+                    linked_id = full.full_chat.linked_chat_id
+                    if linked_id:
+                        full_linked_id = int(f"-100{linked_id}") if not str(linked_id).startswith("-100") else linked_id
+                        chat_to_iter = await self.client.get_entity(full_linked_id)
+                except Exception:
+                    pass
+
             min_id = int(cursor) if cursor and cursor.isdigit() else 0
 
             count = 0
-            async for message in self.client.iter_messages(entity, limit=limit, min_id=min_id):
+            async for message in self.client.iter_messages(chat_to_iter, limit=limit, min_id=min_id):
                 if not message or not message.text:
                     continue
 
@@ -297,14 +308,14 @@ class TelegramMTProtoCollector(BaseCollector):
                 sender_name = f"{getattr(sender, 'first_name', '')} {getattr(sender, 'last_name', '')}".strip() if sender else None
 
                 url = build_telegram_message_url(
-                    chat_username=getattr(entity, "username", None),
-                    chat_id=getattr(entity, "id", 0),
+                    chat_username=getattr(chat_to_iter, "username", None),
+                    chat_id=getattr(chat_to_iter, "id", 0),
                     message_id=message.id,
                 )
 
                 yield NormalizedComment(
                     platform="telegram",
-                    external_comment_id=f"tg_{entity.id}_{message.id}",
+                    external_comment_id=f"tg_{chat_to_iter.id}_{message.id}",
                     target_external_id=str(entity.id),
                     source_name=getattr(entity, "title", target.title_or_name),
                     comment_url=url,
