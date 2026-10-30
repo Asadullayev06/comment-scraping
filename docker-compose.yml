@@ -31,11 +31,10 @@ services:
   # Aiogram 3 Bot Controller, Real-Time Alert Dispatcher & Hermes Bridge API
   bot-controller:
     build: .
-    container_name: operatives-bridge
     restart: unless-stopped
     command: python src/main.py
     ports:
-      - "${OPS_API_PORT:-8080}:8080"
+      - "${OPS_API_PORT:-18890}:18890"
     environment:
       - ADMIN_TELEGRAM_IDS=${ADMIN_TELEGRAM_IDS}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
@@ -52,7 +51,7 @@ services:
       - YOUTUBE_API_KEY=${YOUTUBE_API_KEY:-}
       - X_TWEET_DETAIL_QUERY_ID=${X_TWEET_DETAIL_QUERY_ID:-V94IR8nUKvgjwjd8uKnogg}
       - FB_COMET_DOC_ID=${FB_COMET_DOC_ID:-5959580457497184}
-      - OPS_API_PORT=8080
+      - OPS_API_PORT=18890
       - OPS_API_KEY=${OPS_API_KEY:-}
       - DATABASE_URL=postgresql+asyncpg://operatives:strongpassword@postgres:5432/operatives_db
       - REDIS_URL=redis://redis:6379/0

@@ -52,7 +52,7 @@ class Settings(BaseSettings):
 
     # Internal Hermes Bridge API Settings
     OPS_API_HOST: str = Field(default="0.0.0.0")
-    OPS_API_PORT: int = Field(default=8080)
+    OPS_API_PORT: int = Field(default=18890)
     OPS_API_KEY: Optional[str] = Field(default=None)
 
     @field_validator("ADMIN_TELEGRAM_IDS", mode="before")
