@@ -208,7 +208,9 @@ class TelegramMTProtoCollector(BaseCollector):
             sender_username = getattr(sender, "username", None)
             sender_name = None
             if sender:
-                sender_name = f"{getattr(sender, 'first_name', '')} {getattr(sender, 'last_name', '')}".strip() or sender_username
+                first_n = getattr(sender, "first_name", "") or ""
+                last_n = getattr(sender, "last_name", "") or ""
+                sender_name = f"{first_n} {last_n}".strip() or sender_username
 
             chat_title = meta.get("title") or getattr(chat, "title", "Telegram Chat")
             chat_username = meta.get("username") or getattr(chat, "username", None)
@@ -305,7 +307,9 @@ class TelegramMTProtoCollector(BaseCollector):
                 sender = await message.get_sender()
                 sender_id = str(sender.id) if sender else "unknown"
                 sender_username = getattr(sender, "username", None)
-                sender_name = f"{getattr(sender, 'first_name', '')} {getattr(sender, 'last_name', '')}".strip() if sender else None
+                first_n = (getattr(sender, "first_name", "") or "") if sender else ""
+                last_n = (getattr(sender, "last_name", "") or "") if sender else ""
+                sender_name = f"{first_n} {last_n}".strip() if sender else None
 
                 url = build_telegram_message_url(
                     chat_username=getattr(chat_to_iter, "username", None),
@@ -360,7 +364,9 @@ class TelegramMTProtoCollector(BaseCollector):
 
         numeric_id = str(target_user.id) if target_user else clean_input
         user_handle = getattr(target_user, "username", clean_input if not clean_input.isdigit() else None)
-        user_name = f"{getattr(target_user, 'first_name', '')} {getattr(target_user, 'last_name', '')}".strip() if target_user else None
+        first_n = (getattr(target_user, "first_name", "") or "") if target_user else ""
+        last_n = (getattr(target_user, "last_name", "") or "") if target_user else ""
+        user_name = f"{first_n} {last_n}".strip() if target_user else None
 
         # Upsert author record
         async with async_session_factory() as session:

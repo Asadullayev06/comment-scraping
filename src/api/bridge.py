@@ -36,16 +36,27 @@ def _truncate(text: Optional[str], max_len: int = 180) -> str:
 
 
 def _format_author(author: Optional[PlatformAuthor]) -> str:
-    """Format compact author display string."""
+    """Format compact author display string with clean name, handle, and numeric user ID."""
     if not author:
         return "Unknown"
-    if author.username and author.display_name and author.username != author.display_name:
-        return f"@{author.username} ({_truncate(author.display_name, 35)})"
-    if author.username:
-        return f"@{author.username}"
-    if author.display_name:
-        return _truncate(author.display_name, 40)
-    return str(author.external_user_id or "Unknown")
+    raw_name = (author.display_name or "").replace(" None", "").replace("None ", "").strip()
+    if raw_name == "None":
+        raw_name = ""
+    uid = str(author.external_user_id or "").strip()
+    uname = (author.username or "").strip().lstrip("@")
+
+    if uname and raw_name and uname.lower() != raw_name.lower():
+        base = f"@{uname} ({_truncate(raw_name, 30)})"
+    elif uname:
+        base = f"@{uname}"
+    elif raw_name:
+        base = _truncate(raw_name, 35)
+    else:
+        base = "User"
+
+    if uid and uid != "unknown" and uid not in base:
+        return f"{base} [id:{uid}]"
+    return base
 
 
 def _format_comment(
@@ -59,6 +70,7 @@ def _format_comment(
         "id": comment.id,
         "platform": comment.platform,
         "author": _format_author(author),
+        "author_id": author.external_user_id if author else None,
         "score": comment.severity_score if comment.severity_score is not None else 0,
         "flagged": bool(comment.is_severely_negative),
         "reason": _truncate(comment.llm_reason, 120) if comment.llm_reason else None,
@@ -67,6 +79,22 @@ def _format_comment(
         "url": comment.comment_url or comment.post_url,
         "published_at": pub_dt.strftime("%Y-%m-%d %H:%M") if pub_dt else None,
     }
+
+
+def _cluster_duplicates(items: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    """Collapse copy-paste duplicate comments by normalized text and track occurrences."""
+    clustered: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        norm_key = " ".join((item.get("text") or "").lower().split())
+        if not norm_key:
+            continue
+        if norm_key not in clustered:
+            entry = dict(item)
+            entry["occurrences"] = 1
+            clustered[norm_key] = entry
+        else:
+            clustered[norm_key]["occurrences"] += 1
+    return list(clustered.values())[:limit]
 
 
 async def _resolve_target(session: AsyncSession, raw_target: str) -> Optional[MonitoredTarget]:
@@ -151,10 +179,11 @@ async def _build_target_check_payload(
             or_(Comment.is_severely_negative.is_(True), Comment.severity_score >= settings.LLM_ALERT_SEVERITY_THRESHOLD),
         )
         .order_by(desc(Comment.severity_score), desc(Comment.published_at))
-        .limit(min(flagged_limit, 12))
+        .limit(min(flagged_limit * 2, 30))
     )
     flagged_rows = (await session.execute(flagged_stmt)).all()
-    flagged_items = [_format_comment(c, a, max_text=170) for c, a in flagged_rows]
+    raw_flagged = [_format_comment(c, a, max_text=170) for c, a in flagged_rows]
+    flagged_items = _cluster_duplicates(raw_flagged, limit=min(flagged_limit, 12))
 
     # Small sample of recent normal/unflagged comments for context/vibe
     sample_stmt = (
@@ -363,10 +392,11 @@ async def handle_digest(request: web.Request) -> web.Response:
             .outerjoin(PlatformAuthor, Comment.author_id == PlatformAuthor.id)
             .where(*flag_filters)
             .order_by(desc(Comment.severity_score), desc(Comment.published_at), desc(Comment.ingested_at))
-            .limit(limit)
+            .limit(min(limit * 2, 36))
         )
         rows = (await session.execute(flagged_stmt)).all()
-        flagged_list = [_format_comment(c, a, max_text=170) for c, a in rows]
+        raw_flagged = [_format_comment(c, a, max_text=170) for c, a in rows]
+        flagged_list = _cluster_duplicates(raw_flagged, limit=limit)
 
     return web.json_response(
         {
