@@ -20,8 +20,29 @@ async def init_models():
         try:
             await conn.execute(
                 text(
-                    "UPDATE platform_authors SET display_name = REPLACE(display_name, ' None', '') "
-                    "WHERE display_name LIKE '% None'"
+                    "UPDATE platform_authors SET display_name = TRIM(REPLACE(REPLACE(display_name, ' None', ''), '|', '')) "
+                    "WHERE display_name LIKE '% None%' OR display_name LIKE '%|%'"
+                )
+            )
+            await conn.execute(
+                text(
+                    "UPDATE platform_authors SET display_name = NULL "
+                    "WHERE display_name IS NOT NULL AND TRIM(display_name) = ''"
+                )
+            )
+            # Reset any previously failed / zeroed error rows back to pending with score = NULL so they get re-scored cleanly
+            await conn.execute(
+                text(
+                    "UPDATE comments SET llm_status = 'pending', severity_score = NULL, "
+                    "is_severely_negative = FALSE, is_on_topic = NULL, llm_reason = NULL "
+                    "WHERE llm_status = 'failed' OR llm_reason LIKE 'Evaluation failed:%' OR llm_reason = 'Unclassified fallback'"
+                )
+            )
+            # Re-queue short 1-4 word comments that were skipped before the abuse lexicon was added so insults get checked
+            await conn.execute(
+                text(
+                    "UPDATE comments SET llm_status = 'pending', severity_score = NULL, llm_reason = NULL "
+                    "WHERE llm_status = 'skipped_prefilter' AND llm_reason LIKE 'Skipped pre-filter: emoji, sticker, or short sentence%'"
                 )
             )
             await conn.execute(

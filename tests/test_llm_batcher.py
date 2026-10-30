@@ -37,6 +37,13 @@ def test_is_trivial_comment():
     assert is_trivial_comment("ha shunday boladi") is True
     assert is_trivial_comment("yaxshi rahmat kattakon aka") is True
 
+    # Short 1-4 word abuse/insults/corruption terms must NOT be ignored (lexicon exception)
+    assert is_trivial_comment("jinni") is False
+    assert is_trivial_comment("harom") is False
+    assert is_trivial_comment("hammasi o'g'rilar") is False
+    assert is_trivial_comment("позор ворам") is False
+    assert is_trivial_comment("rüşvətxorlar") is False
+
     # Substantive comments (>=5 words) must NOT be trivial
     assert is_trivial_comment("Bu yangi jarima qonuni xalqni talash uchundir!") is False
     assert is_trivial_comment("These new tax rules are completely absurd and oppressive.") is False

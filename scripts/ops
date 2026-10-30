@@ -136,11 +136,18 @@ def build_parser() -> argparse.ArgumentParser:
     # 4. ops search
     p_search = sub.add_parser(
         "search",
-        help="Search stored comments in PostgreSQL by keyword/phrase across platforms.",
+        help="Search stored comments in PostgreSQL by keyword/reason or audit status/failures.",
     )
-    p_search.add_argument("query", type=str, help="Keyword or phrase to search")
+    p_search.add_argument("query", nargs="?", default="", help="Keyword or phrase to search in text or LLM reason")
     p_search.add_argument("--platform", type=str, default="", help="Optional platform filter")
     p_search.add_argument("--min-score", type=int, default=0, help="Optional minimum severity score (default: 0)")
+    p_search.add_argument(
+        "--status",
+        type=str,
+        default="",
+        help="Filter by llm_status: evaluated, failed, pending, skipped_prefilter",
+    )
+    p_search.add_argument("--failed", action="store_true", help="Shortcut for --status failed")
     p_search.add_argument("--limit", type=int, default=12, help="Max matching comments to return (default: 12)")
 
     # 5. ops sessions
@@ -191,6 +198,8 @@ def main():
                 "q": args.query,
                 "platform": args.platform,
                 "min_score": args.min_score,
+                "status": "failed" if args.failed else args.status,
+                "failed": "true" if args.failed else "",
                 "limit": args.limit,
             },
         )

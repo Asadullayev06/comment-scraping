@@ -111,7 +111,7 @@ class Comment(Base):
     alert_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     target: Mapped[Optional["MonitoredTarget"]] = relationship("MonitoredTarget", back_populates="comments")
-    author: Mapped[Optional["PlatformAuthor"]] = relationship("PlatformAuthor", back_populates="comments")
+    author: Mapped[Optional["PlatformAuthor"]] = relationship("PlatformAuthor", back_populates="comments", lazy="selectin")
 
     __table_args__ = (
         UniqueConstraint("platform", "external_comment_id", name="uq_comment_platform_external_id"),

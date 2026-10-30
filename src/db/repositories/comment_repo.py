@@ -3,7 +3,8 @@
 import hashlib
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
-from sqlalchemy import select, update, func, desc
+from sqlalchemy import select, update, func, desc, or_, and_
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models import Comment, PlatformAuthor, MonitoredTarget
 
@@ -74,14 +75,29 @@ class CommentRepository:
         await self.session.flush()
         return comment
 
-    async def get_pending_for_llm(self, limit: int = 40) -> List[Comment]:
-        """Fetch pending comments ordered by ingestion time for micro-batching."""
+    async def get_pending_for_llm(
+        self,
+        limit: int = 40,
+        target_id: Optional[str] = None,
+        include_failed: bool = True,
+    ) -> List[Comment]:
+        """Fetch pending/unscored comments ordered by ingestion time for micro-batching."""
+        status_conds = [
+            Comment.llm_status == "pending",
+            and_(Comment.severity_score.is_(None), Comment.llm_status.notin_(["skipped_prefilter", "failed"])),
+        ]
+        if include_failed:
+            status_conds.append(Comment.llm_status == "failed")
+
         stmt = (
             select(Comment)
-            .where(Comment.llm_status == "pending")
-            .order_by(Comment.ingested_at.asc())
-            .limit(limit)
+            .options(selectinload(Comment.author))
+            .where(or_(*status_conds))
         )
+        if target_id:
+            stmt = stmt.where(Comment.target_id == target_id)
+
+        stmt = stmt.order_by(Comment.ingested_at.asc()).limit(limit)
         res = await self.session.execute(stmt)
         return list(res.scalars().all())
 
@@ -98,9 +114,9 @@ class CommentRepository:
     async def update_llm_verdict(
         self,
         comment_id: str,
-        is_on_topic: bool,
+        is_on_topic: Optional[bool],
         is_severely_negative: bool,
-        severity_score: int,
+        severity_score: Optional[int],
         llm_reason: Optional[str] = None,
         llm_status: str = "evaluated",
     ) -> None:

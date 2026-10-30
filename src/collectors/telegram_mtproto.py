@@ -208,9 +208,12 @@ class TelegramMTProtoCollector(BaseCollector):
             sender_username = getattr(sender, "username", None)
             sender_name = None
             if sender:
-                first_n = getattr(sender, "first_name", "") or ""
-                last_n = getattr(sender, "last_name", "") or ""
-                sender_name = f"{first_n} {last_n}".strip() or sender_username
+                first_n = (getattr(sender, "first_name", "") or "").replace("|", " ")
+                last_n = (getattr(sender, "last_name", "") or "").replace("|", " ")
+                cand_name = " ".join(f"{first_n} {last_n}".split())
+                if not any(c.isalnum() for c in cand_name):
+                    cand_name = ""
+                sender_name = cand_name or sender_username
 
             chat_title = meta.get("title") or getattr(chat, "title", "Telegram Chat")
             chat_username = meta.get("username") or getattr(chat, "username", None)
@@ -307,9 +310,10 @@ class TelegramMTProtoCollector(BaseCollector):
                 sender = await message.get_sender()
                 sender_id = str(sender.id) if sender else "unknown"
                 sender_username = getattr(sender, "username", None)
-                first_n = (getattr(sender, "first_name", "") or "") if sender else ""
-                last_n = (getattr(sender, "last_name", "") or "") if sender else ""
-                sender_name = f"{first_n} {last_n}".strip() if sender else None
+                first_n = ((getattr(sender, "first_name", "") or "") if sender else "").replace("|", " ")
+                last_n = ((getattr(sender, "last_name", "") or "") if sender else "").replace("|", " ")
+                cand_name = " ".join(f"{first_n} {last_n}".split()) if sender else ""
+                sender_name = cand_name if any(c.isalnum() for c in cand_name) else sender_username
 
                 url = build_telegram_message_url(
                     chat_username=getattr(chat_to_iter, "username", None),

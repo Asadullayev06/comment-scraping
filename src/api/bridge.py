@@ -39,9 +39,11 @@ def _format_author(author: Optional[PlatformAuthor]) -> str:
     """Format compact author display string with clean name, handle, and numeric user ID."""
     if not author:
         return "Unknown"
-    raw_name = (author.display_name or "").replace(" None", "").replace("None ", "").strip()
-    if raw_name == "None":
+    raw_name = (author.display_name or "").replace(" None", "").replace("None ", "").replace("|", " ").strip()
+    if raw_name == "None" or not any(c.isalnum() for c in raw_name):
         raw_name = ""
+    else:
+        raw_name = " ".join(raw_name.split())
     uid = str(author.external_user_id or "").strip()
     uname = (author.username or "").strip().lstrip("@")
 
@@ -67,15 +69,16 @@ def _format_comment(
 ) -> Dict[str, Any]:
     """Serialize a Comment + PlatformAuthor into a compact, token-efficient dictionary."""
     pub_dt = comment.published_at or comment.ingested_at
-    score = comment.severity_score if comment.severity_score is not None else 0
+    score = comment.severity_score
     eff_threshold = threshold if threshold is not None else settings.LLM_ALERT_SEVERITY_THRESHOLD
     return {
         "id": comment.id,
         "platform": comment.platform,
         "author": _format_author(author),
         "author_id": author.external_user_id if author else None,
+        "status": comment.llm_status,
         "score": score,
-        "flagged": bool(score >= eff_threshold),
+        "flagged": bool(score is not None and score >= eff_threshold),
         "reason": _truncate(comment.llm_reason, 120) if comment.llm_reason else None,
         "text": _truncate(comment.content_text, max_text),
         "source": _truncate(comment.source_name, 50) if comment.source_name else None,
@@ -167,6 +170,18 @@ async def _build_target_check_payload(
     )
     skipped_count = (await session.execute(skip_stmt)).scalar() or 0
 
+    fail_stmt = select(func.count(Comment.id)).where(
+        Comment.target_id == target.id,
+        Comment.llm_status == "failed",
+    )
+    failed_count = (await session.execute(fail_stmt)).scalar() or 0
+
+    pend_stmt = select(func.count(Comment.id)).where(
+        Comment.target_id == target.id,
+        Comment.llm_status.in_(["pending", "processing"]),
+    )
+    pending_count = (await session.execute(pend_stmt)).scalar() or 0
+
     threshold = settings.LLM_ALERT_SEVERITY_THRESHOLD
     flagged_count_stmt = select(func.count(Comment.id)).where(
         Comment.target_id == target.id,
@@ -199,13 +214,14 @@ async def _build_target_check_payload(
             Comment.llm_status != "skipped_prefilter",
         )
         .order_by(desc(Comment.published_at), desc(Comment.ingested_at))
-        .limit(min(sample_limit, 8))
+        .limit(min(sample_limit * 2, 16))
     )
     sample_rows = (await session.execute(sample_stmt)).all()
-    sample_items = [
+    raw_sample = [
         {
             "author": _format_author(a),
-            "score": c.severity_score or 0,
+            "status": c.llm_status,
+            "score": c.severity_score,
             "reason": _truncate(c.llm_reason, 90) if c.llm_reason else None,
             "text": _truncate(c.content_text, 120),
             "published_at": (c.published_at or c.ingested_at).strftime("%Y-%m-%d %H:%M")
@@ -214,6 +230,7 @@ async def _build_target_check_payload(
         }
         for c, a in sample_rows
     ]
+    sample_items = _cluster_duplicates(raw_sample, limit=min(sample_limit, 8))
 
     return {
         "target": {
@@ -232,6 +249,8 @@ async def _build_target_check_payload(
             "stored_in_db": total_comments,
             "evaluated": evaluated_count,
             "noise_skipped": skipped_count,
+            "pending": pending_count,
+            "failed": failed_count,
             "flagged_count": flagged_count,
         },
         "flagged_comments": flagged_items,
@@ -315,14 +334,13 @@ async def _execute_inline_scrape(
             await t_repo.update_cursor(target.id, increment_comments=newly_inserted)
             await session.commit()
 
-            total_evaluated = 0
-            if newly_inserted > 0:
-                processor = MicroBatchProcessor()
-                for _ in range(15):
-                    eval_count, _ = await processor.process_batch(session)
-                    if eval_count == 0:
-                        break
-                    total_evaluated += eval_count
+            # Loop micro-batch processor until ALL unscored/failed comments for this target are evaluated
+            processor = MicroBatchProcessor()
+            total_evaluated, _ = await processor.process_all_pending(
+                session=session,
+                target_id=target.id,
+                max_batches=100,
+            )
 
             return newly_inserted, total_evaluated
         except Exception as e:
@@ -375,6 +393,12 @@ async def handle_digest(request: web.Request) -> web.Response:
         skip_stmt = select(func.count(Comment.id)).where(*base_filters, Comment.llm_status == "skipped_prefilter")
         noise_skipped = (await session.execute(skip_stmt)).scalar() or 0
 
+        fail_stmt = select(func.count(Comment.id)).where(*base_filters, Comment.llm_status == "failed")
+        failed_count = (await session.execute(fail_stmt)).scalar() or 0
+
+        pend_stmt = select(func.count(Comment.id)).where(*base_filters, Comment.llm_status.in_(["pending", "processing"]))
+        pending_count = (await session.execute(pend_stmt)).scalar() or 0
+
         plat_stmt = (
             select(Comment.platform, func.count(Comment.id))
             .where(*base_filters)
@@ -407,6 +431,8 @@ async def handle_digest(request: web.Request) -> web.Response:
             "total_ingested": total_ingested,
             "evaluated": evaluated_count,
             "noise_skipped": noise_skipped,
+            "pending": pending_count,
+            "failed": failed_count,
             "platform_breakdown": platform_breakdown,
             "flagged_count": flagged_total,
             "returned_flagged": len(flagged_list),
@@ -455,6 +481,10 @@ async def handle_check(request: web.Request) -> web.Response:
                 },
                 status=404,
             )
+
+        # If this target has pending/unscored comments sitting in DB, drain them before returning
+        processor = MicroBatchProcessor()
+        await processor.process_all_pending(session=session, target_id=target.id, max_batches=25)
 
         payload = await _build_target_check_payload(session, target, flagged_limit=limit, sample_limit=8)
         return web.json_response(payload)
@@ -535,17 +565,34 @@ async def handle_scrape(request: web.Request) -> web.Response:
 
 
 async def handle_search(request: web.Request) -> web.Response:
-    """GET /api/search?q=<keyword>&platform=&min_score=0&limit=12"""
+    """GET /api/search?q=<keyword>&platform=&min_score=0&status=&failed=false&limit=12"""
     query_str = (request.query.get("q") or request.query.get("query") or "").strip()
-    if not query_str:
-        return web.json_response({"error": "Missing required 'q' search query parameter."}, status=400)
+    status_filter = request.query.get("status", "").strip().lower() or None
+    failed_only = request.query.get("failed", "false").lower() in ("true", "1", "yes")
+    if failed_only and not status_filter:
+        status_filter = "failed"
+
+    if not query_str and not status_filter:
+        return web.json_response(
+            {"error": "Provide either 'q' (search keyword) or 'status' / 'failed=true' parameter."},
+            status=400,
+        )
 
     platform = request.query.get("platform", "").strip().lower() or None
     min_score = int(request.query.get("min_score", 0))
     limit = min(max(1, int(request.query.get("limit", 12))), 18)
 
     async with async_session_factory() as session:
-        filters = [Comment.content_text.ilike(f"%{query_str}%")]
+        filters = []
+        if query_str:
+            filters.append(
+                or_(
+                    Comment.content_text.ilike(f"%{query_str}%"),
+                    Comment.llm_reason.ilike(f"%{query_str}%"),
+                )
+            )
+        if status_filter:
+            filters.append(Comment.llm_status == status_filter)
         if platform:
             filters.append(Comment.platform == platform)
         if min_score > 0:
@@ -559,14 +606,16 @@ async def handle_search(request: web.Request) -> web.Response:
             .outerjoin(PlatformAuthor, Comment.author_id == PlatformAuthor.id)
             .where(*filters)
             .order_by(desc(Comment.severity_score), desc(Comment.published_at), desc(Comment.ingested_at))
-            .limit(limit)
+            .limit(min(limit * 3, 45))
         )
         rows = (await session.execute(stmt)).all()
-        results = [_format_comment(c, a, max_text=160) for c, a in rows]
+        raw_results = [_format_comment(c, a, max_text=160) for c, a in rows]
+        results = _cluster_duplicates(raw_results, limit=limit)
 
     return web.json_response(
         {
-            "query": query_str,
+            "query": query_str or None,
+            "status_filter": status_filter or "all",
             "platform_filter": platform or "all",
             "min_score": min_score,
             "total_matches": total_matches,

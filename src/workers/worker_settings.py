@@ -118,14 +118,15 @@ async def scrape_target_job(ctx: Dict[str, Any], target_id: str, is_backfill: bo
                 newly_inserted=newly_inserted,
             )
 
-            # Trigger micro-batch processing until all newly inserted comments are evaluated
-            if newly_inserted > 0:
-                processor = MicroBatchProcessor()
-                redis_client = ctx.get("redis")
-                for _ in range(15):
-                    eval_count, _ = await processor.process_batch(session, redis_client=redis_client)
-                    if eval_count == 0:
-                        break
+            # Trigger micro-batch processing until ALL unscored comments on this target are evaluated
+            processor = MicroBatchProcessor()
+            redis_client = ctx.get("redis")
+            await processor.process_all_pending(
+                session=session,
+                target_id=target.id,
+                redis_client=redis_client,
+                max_batches=100,
+            )
 
             return newly_inserted
         except Exception as e:
