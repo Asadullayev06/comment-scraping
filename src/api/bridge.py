@@ -63,16 +63,19 @@ def _format_comment(
     comment: Comment,
     author: Optional[PlatformAuthor] = None,
     max_text: int = 180,
+    threshold: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Serialize a Comment + PlatformAuthor into a compact, token-efficient dictionary."""
     pub_dt = comment.published_at or comment.ingested_at
+    score = comment.severity_score if comment.severity_score is not None else 0
+    eff_threshold = threshold if threshold is not None else settings.LLM_ALERT_SEVERITY_THRESHOLD
     return {
         "id": comment.id,
         "platform": comment.platform,
         "author": _format_author(author),
         "author_id": author.external_user_id if author else None,
-        "score": comment.severity_score if comment.severity_score is not None else 0,
-        "flagged": bool(comment.is_severely_negative),
+        "score": score,
+        "flagged": bool(score >= eff_threshold),
         "reason": _truncate(comment.llm_reason, 120) if comment.llm_reason else None,
         "text": _truncate(comment.content_text, max_text),
         "source": _truncate(comment.source_name, 50) if comment.source_name else None,
@@ -164,9 +167,10 @@ async def _build_target_check_payload(
     )
     skipped_count = (await session.execute(skip_stmt)).scalar() or 0
 
+    threshold = settings.LLM_ALERT_SEVERITY_THRESHOLD
     flagged_count_stmt = select(func.count(Comment.id)).where(
         Comment.target_id == target.id,
-        or_(Comment.is_severely_negative.is_(True), Comment.severity_score >= settings.LLM_ALERT_SEVERITY_THRESHOLD),
+        Comment.severity_score >= threshold,
     )
     flagged_count = (await session.execute(flagged_count_stmt)).scalar() or 0
 
@@ -176,13 +180,13 @@ async def _build_target_check_payload(
         .outerjoin(PlatformAuthor, Comment.author_id == PlatformAuthor.id)
         .where(
             Comment.target_id == target.id,
-            or_(Comment.is_severely_negative.is_(True), Comment.severity_score >= settings.LLM_ALERT_SEVERITY_THRESHOLD),
+            Comment.severity_score >= threshold,
         )
         .order_by(desc(Comment.severity_score), desc(Comment.published_at))
         .limit(min(flagged_limit * 2, 30))
     )
     flagged_rows = (await session.execute(flagged_stmt)).all()
-    raw_flagged = [_format_comment(c, a, max_text=170) for c, a in flagged_rows]
+    raw_flagged = [_format_comment(c, a, max_text=170, threshold=threshold) for c, a in flagged_rows]
     flagged_items = _cluster_duplicates(raw_flagged, limit=min(flagged_limit, 12))
 
     # Small sample of recent normal/unflagged comments for context/vibe
@@ -191,7 +195,7 @@ async def _build_target_check_payload(
         .outerjoin(PlatformAuthor, Comment.author_id == PlatformAuthor.id)
         .where(
             Comment.target_id == target.id,
-            or_(Comment.is_severely_negative.is_(False), Comment.is_severely_negative.is_(None)),
+            or_(Comment.severity_score < threshold, Comment.severity_score.is_(None)),
             Comment.llm_status != "skipped_prefilter",
         )
         .order_by(desc(Comment.published_at), desc(Comment.ingested_at))
@@ -202,6 +206,7 @@ async def _build_target_check_payload(
         {
             "author": _format_author(a),
             "score": c.severity_score or 0,
+            "reason": _truncate(c.llm_reason, 90) if c.llm_reason else None,
             "text": _truncate(c.content_text, 120),
             "published_at": (c.published_at or c.ingested_at).strftime("%Y-%m-%d %H:%M")
             if (c.published_at or c.ingested_at)
@@ -378,11 +383,7 @@ async def handle_digest(request: web.Request) -> web.Response:
         plat_rows = (await session.execute(plat_stmt)).all()
         platform_breakdown = {r[0]: r[1] for r in plat_rows}
 
-        if min_score <= 7:
-            flag_cond = or_(Comment.severity_score >= min_score, Comment.is_severely_negative.is_(True))
-        else:
-            flag_cond = Comment.severity_score >= min_score
-        flag_filters = [*base_filters, flag_cond]
+        flag_filters = [*base_filters, Comment.severity_score >= min_score]
 
         flagged_count_stmt = select(func.count(Comment.id)).where(*flag_filters)
         flagged_total = (await session.execute(flagged_count_stmt)).scalar() or 0
@@ -395,7 +396,7 @@ async def handle_digest(request: web.Request) -> web.Response:
             .limit(min(limit * 2, 36))
         )
         rows = (await session.execute(flagged_stmt)).all()
-        raw_flagged = [_format_comment(c, a, max_text=170) for c, a in rows]
+        raw_flagged = [_format_comment(c, a, max_text=170, threshold=min_score) for c, a in rows]
         flagged_list = _cluster_duplicates(raw_flagged, limit=limit)
 
     return web.json_response(

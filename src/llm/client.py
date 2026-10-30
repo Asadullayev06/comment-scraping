@@ -134,7 +134,7 @@ class DeepSeekClassifier:
                         on_topic=False,
                         severely_negative=False,
                         severity_score=1,
-                        reason=None,
+                        reason="Off-topic or benign everyday comment.",
                     )
                 )
         return verdicts

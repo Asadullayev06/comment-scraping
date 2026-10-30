@@ -31,12 +31,13 @@ def test_is_trivial_comment():
     assert is_trivial_comment("@user") is True
     assert is_trivial_comment("https://example.com") is True
     
-    # Short 1-3 word casual comments should be ignored
+    # Short 1-4 word casual comments should be ignored
     assert is_trivial_comment("zor gap yoq") is True
     assert is_trivial_comment("raxmat aka") is True
     assert is_trivial_comment("ha shunday boladi") is True
-    
-    # Substantive comments (>3 words) must NOT be trivial
+    assert is_trivial_comment("yaxshi rahmat kattakon aka") is True
+
+    # Substantive comments (>=5 words) must NOT be trivial
     assert is_trivial_comment("Bu yangi jarima qonuni xalqni talash uchundir!") is False
     assert is_trivial_comment("These new tax rules are completely absurd and oppressive.") is False
 
@@ -52,6 +53,8 @@ async def test_deepseek_mock_evaluation():
     verdicts, meta = await classifier.evaluate_batch(items)
     assert len(verdicts) == 3
     assert verdicts[0].severely_negative is False
+    assert verdicts[0].reason and len(verdicts[0].reason) > 0
     assert verdicts[1].severely_negative is True
     assert verdicts[1].severity_score >= 7
     assert verdicts[2].severely_negative is False
+    assert verdicts[2].reason and len(verdicts[2].reason) > 0

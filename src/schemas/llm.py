@@ -16,7 +16,10 @@ class CommentVerdict(BaseModel):
     on_topic: bool = Field(..., description="True if referencing government policies, regulations, rules, or state bodies")
     severely_negative: bool = Field(..., description="True if expressing extreme negativity, strong hostility, or fierce opposition")
     severity_score: int = Field(..., ge=0, le=10, description="Severity score from 0 (harmless/off-topic) to 10 (extreme hostility/unrest)")
-    reason: Optional[str] = Field(None, description="Strict 1-sentence English explanation if severely_negative is true")
+    reason: Optional[str] = Field(
+        default="Evaluated",
+        description="Concise 1-sentence English explanation of the score for every comment (0 to 10)",
+    )
 
 
 class BatchEvaluationResponse(BaseModel):

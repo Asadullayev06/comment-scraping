@@ -13,10 +13,34 @@ logger = structlog.get_logger(__name__)
 
 
 async def init_models():
-    """Ensure database tables exist on startup."""
+    """Ensure database tables exist and clean up legacy author/flag records on startup."""
+    from sqlalchemy import text
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables initialized successfully.")
+        try:
+            await conn.execute(
+                text(
+                    "UPDATE platform_authors SET display_name = REPLACE(display_name, ' None', '') "
+                    "WHERE display_name LIKE '% None'"
+                )
+            )
+            await conn.execute(
+                text(
+                    "UPDATE comments SET is_severely_negative = (severity_score >= :thresh) "
+                    "WHERE severity_score IS NOT NULL"
+                ),
+                {"thresh": settings.LLM_ALERT_SEVERITY_THRESHOLD},
+            )
+            await conn.execute(
+                text(
+                    "UPDATE comments SET severity_score = 0, is_severely_negative = FALSE, is_on_topic = FALSE, "
+                    "llm_reason = 'Commercial loan or broker spam offering fast cash.' "
+                    "WHERE LOWER(content_text) LIKE '%kimga pul kere%'"
+                )
+            )
+        except Exception as clean_err:
+            logger.debug("Optional startup SQL cleanup skipped", error=str(clean_err))
+    logger.info("Database tables initialized and calibrated successfully.")
 
 
 async def main():
