@@ -118,6 +118,25 @@ class SessionRepository:
         )
         await self.session.execute(stmt)
 
+    async def increment_error(self, session_id: str) -> None:
+        """Increment error_count on a session when authentication or scrape fails."""
+        stmt = (
+            update(ScraperSession)
+            .where(ScraperSession.id == session_id)
+            .values(error_count=ScraperSession.error_count + 1)
+        )
+        await self.session.execute(stmt)
+
+    async def update_cookies(self, session_id: str, cookies: Any) -> None:
+        """Persist updated/rotated cookies (e.g. rotated ct0) back to the session."""
+        encrypted_cookies = self.encrypt_data(cookies)
+        stmt = (
+            update(ScraperSession)
+            .where(ScraperSession.id == session_id)
+            .values(cookies_encrypted=encrypted_cookies)
+        )
+        await self.session.execute(stmt)
+
     async def list_sessions(self, platform: Optional[str] = None) -> List[ScraperSession]:
         stmt = select(ScraperSession)
         if platform:

@@ -18,6 +18,7 @@ from src.db.repositories.author_repo import AuthorRepository
 from src.db.repositories.comment_repo import CommentRepository
 from src.db.repositories.session_repo import SessionRepository
 from src.bot.handlers.targets import detect_platform_and_id
+from src.collectors.base import ScraperError
 from src.collectors.pool_manager import SessionPoolManager
 from src.collectors.youtube import YouTubeCollector
 from src.collectors.twitter_x import TwitterXCollector
@@ -296,17 +297,17 @@ async def _execute_inline_scrape(
     target_id: str,
     mtproto: Optional[Any] = None,
     limit: int = 200,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, Optional[Dict[str, Any]]]:
     """Run an on-demand scrape and DeepSeek micro-batch evaluation synchronously.
 
     Returns:
-        Tuple of (newly_inserted_count, evaluated_count)
+        Tuple of (newly_inserted_count, evaluated_count, focal_post_meta)
     """
     async with async_session_factory() as session:
         t_repo = TargetRepository(session)
         target = await t_repo.get_by_id(target_id)
         if not target:
-            return 0, 0
+            return 0, 0, None
 
         pool_mgr = SessionPoolManager(session)
         collector = None
@@ -325,7 +326,7 @@ async def _execute_inline_scrape(
             collector = FacebookCollector(pool_mgr)
 
         if not collector:
-            return 0, 0
+            return 0, 0, None
 
         author_repo = AuthorRepository(session)
         comment_repo = CommentRepository(session)
@@ -376,10 +377,13 @@ async def _execute_inline_scrape(
                 max_batches=100,
             )
 
-            return newly_inserted, total_evaluated
+            focal_meta = getattr(collector, "last_focal_tweet_meta", None)
+            return newly_inserted, total_evaluated, focal_meta
+        except ScraperError:
+            raise
         except Exception as e:
             logger.error("Inline scrape failed", target_id=target_id, error=str(e))
-            return newly_inserted, 0
+            return newly_inserted, 0, None
 
 
 @web.middleware
@@ -607,7 +611,7 @@ async def _execute_profile_analysis(
             post_id_map[shortcode] = t_id
 
         if scrape_comments:
-            ins, ev = await _execute_inline_scrape(t_id, mtproto=mtproto, limit=per_post_limit)
+            ins, ev, _ = await _execute_inline_scrape(t_id, mtproto=mtproto, limit=per_post_limit)
             total_newly_ingested += ins
             total_evaluated_in_run += ev
             # Safe per-post delay when walking multiple posts with live network calls
@@ -1161,7 +1165,19 @@ async def handle_scrape(request: web.Request) -> web.Response:
         return web.json_response(resp_payload)
 
     # Synchronous scrape + DeepSeek batch evaluation
-    newly_inserted, evaluated = await _execute_inline_scrape(target_id, mtproto=mtproto, limit=limit)
+    try:
+        newly_inserted, evaluated, focal_meta = await _execute_inline_scrape(target_id, mtproto=mtproto, limit=limit)
+    except ScraperError as s_err:
+        return web.json_response(
+            {
+                "error": s_err.error_code,
+                "message": s_err.message,
+                "platform": platform,
+                "external_id": external_id,
+                "url": clean_url,
+            },
+            status=s_err.status_code,
+        )
 
     async with async_session_factory() as session:
         t_repo = TargetRepository(session)
@@ -1171,6 +1187,8 @@ async def handle_scrape(request: web.Request) -> web.Response:
             payload["profile"] = profile_meta
         if resolved_post_meta:
             payload["resolved_post"] = resolved_post_meta
+        if focal_meta:
+            payload["tweet"] = focal_meta
         if profile_recent_preview:
             payload["profile_recent_posts"] = profile_recent_preview
         scrape_res: Dict[str, Any] = {

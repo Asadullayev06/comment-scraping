@@ -46,6 +46,17 @@ class SessionPoolManager:
         await self.session_repo.set_cooldown(session_id, minutes=cooldown_minutes)
         await self.db_session.commit()
 
+    async def report_session_error(self, session_id: str) -> None:
+        """Increment error_count when a session is rejected or cookies are invalid."""
+        logger.warning("Session authentication or GraphQL error; incrementing error_count", session_id=session_id)
+        await self.session_repo.increment_error(session_id)
+        await self.db_session.commit()
+
+    async def update_session_cookies(self, session_id: str, cookies: Dict[str, Any]) -> None:
+        """Save rotated cookies (e.g. fresh ct0) back to the database."""
+        await self.session_repo.update_cookies(session_id, cookies)
+        await self.db_session.commit()
+
     async def report_challenge(
         self,
         session_id: str,

@@ -1,18 +1,119 @@
-"""X (Twitter) Collector supporting both Official API v2 (Bearer Token) and GraphQL TweetDetail (Burner Cookies)."""
+"""X (Twitter) Collector supporting both Official API v2 (Bearer Token) and GraphQL TweetDetail (Burner Cookies + twikit + Playwright fallback)."""
 
 import json
-from typing import AsyncIterator, Optional, Dict, Any, List
+import re
+from email.utils import parsedate_to_datetime
+from typing import AsyncIterator, Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone
 import urllib.parse
 import httpx
 import structlog
 from src.config import settings
-from src.collectors.base import BaseCollector
+from src.collectors.base import BaseCollector, ScraperError
 from src.schemas.comment import NormalizedComment
 from src.db.models import MonitoredTarget
 from src.collectors.pool_manager import SessionPoolManager
 
 logger = structlog.get_logger(__name__)
+
+# Complete GraphQL feature flags required by X's TweetDetail endpoint (matched with twikit 2.3.x)
+X_GRAPHQL_FEATURES: Dict[str, Any] = {
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "responsive_web_home_pinned_timelines_enabled": True,
+    "blue_business_profile_image_shape_enabled": True,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "graphql_timeline_v2_bookmark_timeline": True,
+    "hidden_profile_likes_enabled": True,
+    "highlights_tweets_tab_ui_enabled": True,
+    "interactive_text_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "longform_notetweets_richtext_consumption_enabled": True,
+    "profile_foundations_tweet_stats_enabled": True,
+    "profile_foundations_tweet_stats_tweet_frequency": True,
+    "responsive_web_birdwatch_note_limit_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "responsive_web_enhance_cards_enabled": False,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_media_download_video_enabled": False,
+    "responsive_web_text_conversations_enabled": False,
+    "responsive_web_twitter_article_data_v2_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": False,
+    "responsive_web_twitter_blue_verified_badge_is_enabled": True,
+    "rweb_lists_timeline_redesign_enabled": True,
+    "rweb_tipjar_consumption_enabled": True,
+    "spaces_2022_h2_clipping": True,
+    "spaces_2022_h2_spaces_communities": True,
+    "standardized_nudges_misinfo": True,
+    "subscriptions_verification_info_verified_since_enabled": True,
+    "tweet_awards_web_tipping_enabled": False,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "tweet_with_visibility_results_prefer_gql_media_interstitial_enabled": False,
+    "tweetypie_unmention_optimization_enabled": True,
+    "verified_phone_label_enabled": False,
+    "vibe_api_enabled": True,
+    "view_counts_everywhere_api_enabled": True,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "creator_subscriptions_quote_tweet_preview_enabled": False,
+    "articles_preview_enabled": True,
+    "rweb_video_timestamps_enabled": True,
+}
+
+X_PUBLIC_WEB_BEARER = (
+    "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs"
+    "%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+)
+
+# Candidate TweetDetail GraphQL query IDs (twikit current + common rotations)
+X_TWEET_DETAIL_QUERY_IDS = [
+    "U0HTv-bAWTBYylwEMT7x5A",
+    "_8aYOgEDz35BrBcBal1-_w",
+    "QuBlQ6SxNAQCt6-kBiCXCQ",
+    "V94IR8nUKvgjwjd8uKnogg",
+    "nBS-WpgA6ZG0CyNHD517JQ",
+]
+
+
+def _parse_x_created_at(raw_dt: Optional[str]) -> datetime:
+    """Parse either ISO-8601 ('2026-03-01T12:00:00Z') or Twitter Ruby date ('Wed Oct 10 20:19:24 +0000 2018')."""
+    if not raw_dt:
+        return datetime.now(timezone.utc)
+    try:
+        return datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    try:
+        return parsedate_to_datetime(raw_dt)
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def _patch_twikit_transaction() -> None:
+    """Ensure twikit's ClientTransaction.init never crashes if X updates its ondemand.s script layout."""
+    try:
+        from twikit.x_client_transaction import ClientTransaction
+
+        if getattr(ClientTransaction, "_ops_patched", False):
+            return
+
+        orig_get_indices = ClientTransaction.get_indices
+
+        async def _safe_get_indices(self, home_page_response, session, headers):
+            try:
+                return await orig_get_indices(self, home_page_response, session, headers)
+            except Exception:
+                # Fallback to standard key byte indices so ClientTransaction can still generate transaction IDs
+                return 2, [12, 14, 7]
+
+        ClientTransaction.get_indices = _safe_get_indices
+        ClientTransaction._ops_patched = True
+    except Exception:
+        pass
 
 
 class TwitterXCollector(BaseCollector):
@@ -27,6 +128,7 @@ class TwitterXCollector(BaseCollector):
         self.pool_manager = pool_manager
         self.query_id = query_id or settings.X_TWEET_DETAIL_QUERY_ID
         self.bearer_token = bearer_token if bearer_token is not None else settings.X_BEARER_TOKEN
+        self.last_focal_tweet_meta: Optional[Dict[str, Any]] = None
 
     async def start(self) -> None:
         pass
@@ -37,10 +139,11 @@ class TwitterXCollector(BaseCollector):
     async def _fetch_api_v2_replies(
         self,
         tweet_id: str,
+        target: MonitoredTarget,
         cursor: Optional[str] = None,
         limit: int = 500,
     ) -> AsyncIterator[NormalizedComment]:
-        """Fetch replies to a post using X Official API v2 recent search (conversation_id:<tweet_id>)."""
+        """Fetch focal tweet + replies using X Official API v2 Bearer Token."""
         raw_token = urllib.parse.unquote(self.bearer_token or "").strip()
         if raw_token.lower().startswith("bearer "):
             raw_token = raw_token[7:].strip()
@@ -53,11 +156,54 @@ class TwitterXCollector(BaseCollector):
         total_yielded = 0
 
         async with httpx.AsyncClient(headers=headers, timeout=25.0) as client:
+            # Step 1: Verify the focal tweet exists and fetch its text + author
+            focal_params = {
+                "tweet.fields": "id,text,author_id,created_at,public_metrics,conversation_id",
+                "expansions": "author_id",
+                "user.fields": "id,name,username",
+            }
+            focal_resp = None
+            for base_host in ("https://api.x.com", "https://api.twitter.com"):
+                try:
+                    focal_resp = await client.get(f"{base_host}/2/tweets/{tweet_id}", params=focal_params)
+                    if focal_resp.status_code != 404:
+                        break
+                except Exception as req_err:
+                    logger.warning("X API v2 focal tweet check error", host=base_host, error=str(req_err))
+
+            if focal_resp is not None:
+                if focal_resp.status_code in (401, 403):
+                    raise ScraperError("x session rejected", f"X API v2 Bearer Token rejected (HTTP {focal_resp.status_code})", status_code=401)
+                if focal_resp.status_code == 429:
+                    raise ScraperError("rate limited", "X API v2 rate limit exceeded (HTTP 429)", status_code=429)
+                if focal_resp.status_code == 200:
+                    f_json = focal_resp.json()
+                    if "errors" in f_json and not f_json.get("data"):
+                        raise ScraperError("tweet not found", f"Tweet {tweet_id} not found or deleted", status_code=404)
+                    f_data = f_json.get("data") or {}
+                    f_users = ((f_json.get("includes") or {}).get("users") or [])
+                    f_author = f_users[0] if f_users else {}
+                    f_username = f_author.get("username") or "unknown"
+                    f_metrics = f_data.get("public_metrics") or {}
+                    self.last_focal_tweet_meta = {
+                        "id": str(f_data.get("id") or tweet_id),
+                        "author": f"@{f_username}",
+                        "author_name": f_author.get("name"),
+                        "text": f_data.get("text") or "",
+                        "published_at": f_data.get("created_at"),
+                        "like_count": f_metrics.get("like_count", 0),
+                        "reply_count": f_metrics.get("reply_count", 0),
+                        "retweet_count": f_metrics.get("retweet_count", 0),
+                    }
+                    if f_data.get("text"):
+                        target.title_or_name = f"X @{f_username}: {f_data['text'][:80]}"
+
+            # Step 2: Fetch replies via recent search
             while total_yielded < limit:
                 params: Dict[str, Any] = {
                     "query": f"conversation_id:{tweet_id}",
                     "max_results": min(100, max(10, limit - total_yielded)),
-                    "tweet.fields": "id,text,author_id,created_at,conversation_id,in_reply_to_user_id",
+                    "tweet.fields": "id,text,author_id,created_at,conversation_id,in_reply_to_user_id,public_metrics",
                     "expansions": "author_id",
                     "user.fields": "id,name,username",
                 }
@@ -73,13 +219,14 @@ class TwitterXCollector(BaseCollector):
                     except Exception as req_err:
                         logger.warning("X API v2 request error", host=base_host, error=str(req_err))
 
-                if resp is None or resp.status_code != 200:
-                    logger.warning(
-                        "X API v2 search returned non-200",
-                        status=resp.status_code if resp else None,
-                        body=resp.text[:200] if resp else None,
-                    )
-                    break
+                if resp is None:
+                    raise ScraperError("x upstream error", "Failed to connect to X API v2", status_code=502)
+                if resp.status_code in (401, 403):
+                    raise ScraperError("x session rejected", f"X API v2 rejected credentials (HTTP {resp.status_code})", status_code=401)
+                if resp.status_code == 429:
+                    raise ScraperError("rate limited", "X API v2 rate limit exceeded", status_code=429)
+                if resp.status_code != 200:
+                    raise ScraperError("x api error", f"X API v2 returned HTTP {resp.status_code}", status_code=502)
 
                 payload = resp.json()
                 tweets = payload.get("data") or []
@@ -105,20 +252,15 @@ class TwitterXCollector(BaseCollector):
                     username = u_info.get("username")
                     display_name = u_info.get("name")
                     text = tw.get("text") or ""
-                    created_str = tw.get("created_at")
-                    pub_dt = datetime.now(timezone.utc)
-                    if created_str:
-                        try:
-                            pub_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
-                        except Exception:
-                            pass
+                    pub_dt = _parse_x_created_at(tw.get("created_at"))
+                    metrics = tw.get("public_metrics") or {}
 
                     yield NormalizedComment(
                         platform="x",
                         external_comment_id=f"x_{reply_id}",
                         parent_external_id=str(tweet_id),
                         target_external_id=str(tweet_id),
-                        source_name=f"X Post @{username}" if username else f"X Post {tweet_id}",
+                        source_name=target.title_or_name or (f"X Post @{username}" if username else f"X Post {tweet_id}"),
                         post_url=f"https://x.com/i/status/{tweet_id}",
                         comment_url=f"https://x.com/{username}/status/{reply_id}" if username else f"https://x.com/i/status/{reply_id}",
                         author_external_id=author_id,
@@ -126,6 +268,7 @@ class TwitterXCollector(BaseCollector):
                         author_display_name=display_name,
                         content_text=text,
                         published_at=pub_dt,
+                        child_comment_count=int(metrics.get("reply_count") or 0),
                     )
                     total_yielded += 1
 
@@ -134,41 +277,394 @@ class TwitterXCollector(BaseCollector):
                 if not next_token:
                     break
 
-    def _extract_tweet_result(self, tweet_res: Dict[str, Any], focal_tweet_id: str) -> Optional[NormalizedComment]:
-        """Parse a single GraphQL tweet_results object into a NormalizedComment."""
+    def _unwrap_tweet_result(self, tweet_res: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Unwrap TweetWithVisibilityResults or check for TweetTombstone / TweetUnavailable."""
         if not isinstance(tweet_res, dict):
             return None
-        if tweet_res.get("__typename") == "TweetWithVisibilityResults" and "tweet" in tweet_res:
-            tweet_res = tweet_res.get("tweet") or {}
+        typename = tweet_res.get("__typename")
+        if typename == "TweetWithVisibilityResults" and "tweet" in tweet_res:
+            return tweet_res.get("tweet")
+        if typename in ("TweetTombstone", "TweetUnavailable"):
+            return tweet_res
+        return tweet_res
 
-        legacy = tweet_res.get("legacy") or {}
-        reply_id = str(legacy.get("id_str") or tweet_res.get("rest_id") or "")
+    def _extract_focal_meta(self, tweet_res: Dict[str, Any], focal_tweet_id: str) -> Optional[Dict[str, Any]]:
+        """Extract focal tweet metadata (text, author, likes, replies, timestamp) from GraphQL result."""
+        unwrapped = self._unwrap_tweet_result(tweet_res)
+        if not unwrapped or unwrapped.get("__typename") in ("TweetTombstone", "TweetUnavailable"):
+            return None
+
+        legacy = unwrapped.get("legacy") or {}
+        rest_id = str(legacy.get("id_str") or unwrapped.get("rest_id") or "")
+        if rest_id != str(focal_tweet_id):
+            return None
+
+        user_result = ((unwrapped.get("core") or {}).get("user_results") or {}).get("result") or {}
+        user_legacy = user_result.get("legacy") or {}
+        user_core = user_result.get("core") or {}
+        username = user_legacy.get("screen_name") or user_core.get("screen_name") or "unknown"
+        display_name = user_legacy.get("name") or user_core.get("name") or username
+
+        # Support NoteTweet (long-form tweet text)
+        note_text = (
+            (((unwrapped.get("note_tweet") or {}).get("note_tweet_results") or {}).get("result") or {}).get("text")
+        )
+        full_text = note_text or legacy.get("full_text") or ""
+        pub_dt = _parse_x_created_at(legacy.get("created_at"))
+
+        return {
+            "id": rest_id,
+            "author": f"@{username}",
+            "author_name": display_name,
+            "author_id": str(user_result.get("rest_id") or username),
+            "text": full_text,
+            "published_at": pub_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "like_count": int(legacy.get("favorite_count") or 0),
+            "reply_count": int(legacy.get("reply_count") or 0),
+            "retweet_count": int(legacy.get("retweet_count") or 0),
+        }
+
+    def _extract_tweet_result(
+        self,
+        tweet_res: Dict[str, Any],
+        focal_tweet_id: str,
+        source_title: Optional[str] = None,
+    ) -> Optional[NormalizedComment]:
+        """Parse a single GraphQL tweet_results object into a NormalizedComment."""
+        unwrapped = self._unwrap_tweet_result(tweet_res)
+        if not unwrapped or unwrapped.get("__typename") in ("TweetTombstone", "TweetUnavailable"):
+            return None
+
+        legacy = unwrapped.get("legacy") or {}
+        reply_id = str(legacy.get("id_str") or unwrapped.get("rest_id") or "")
         if not reply_id or reply_id == str(focal_tweet_id):
             return None
 
-        user_result = ((tweet_res.get("core") or {}).get("user_results") or {}).get("result") or {}
+        user_result = ((unwrapped.get("core") or {}).get("user_results") or {}).get("result") or {}
         user_legacy = user_result.get("legacy") or {}
         user_core = user_result.get("core") or {}
         username = user_legacy.get("screen_name") or user_core.get("screen_name")
         display_name = user_legacy.get("name") or user_core.get("name")
-        text = legacy.get("full_text") or ""
+
+        note_text = (
+            (((unwrapped.get("note_tweet") or {}).get("note_tweet_results") or {}).get("result") or {}).get("text")
+        )
+        text = note_text or legacy.get("full_text") or ""
         if not text:
             return None
+
+        # Strip leading @mention chains if the reply still has actual body text, or keep full text
+        pub_dt = _parse_x_created_at(legacy.get("created_at"))
+        reply_count = int(legacy.get("reply_count") or 0)
 
         return NormalizedComment(
             platform="x",
             external_comment_id=f"x_{reply_id}",
-            parent_external_id=str(focal_tweet_id),
+            parent_external_id=str(legacy.get("in_reply_to_status_id_str") or focal_tweet_id),
             target_external_id=str(focal_tweet_id),
-            source_name=f"X Post @{username}" if username else f"X Post {focal_tweet_id}",
+            source_name=source_title or (f"X Post @{username}" if username else f"X Post {focal_tweet_id}"),
             post_url=f"https://x.com/i/status/{focal_tweet_id}",
             comment_url=f"https://x.com/{username}/status/{reply_id}" if username else f"https://x.com/i/status/{reply_id}",
             author_external_id=str(user_result.get("rest_id") or username or "unknown"),
             author_username=username,
             author_display_name=display_name,
             content_text=text,
-            published_at=datetime.now(timezone.utc),
+            published_at=pub_dt,
+            child_comment_count=reply_count,
         )
+
+    def _parse_tweet_detail_payload(
+        self,
+        data: Dict[str, Any],
+        focal_tweet_id: str,
+        target: MonitoredTarget,
+    ) -> Tuple[bool, List[NormalizedComment], Optional[str]]:
+        """Parse a TweetDetail GraphQL JSON payload.
+
+        Returns:
+            Tuple of (focal_tweet_found, list_of_replies, next_bottom_cursor)
+        """
+        errors = data.get("errors") or []
+        threaded = (data.get("data") or {}).get("threaded_conversation_with_injections_v2") or {}
+        instructions = threaded.get("instructions") or []
+
+        # Also check tweetResult fallback structure
+        single_res = ((data.get("data") or {}).get("tweetResult") or {}).get("result")
+        focal_found = False
+        focal_unavailable = False
+
+        if single_res:
+            if single_res.get("__typename") in ("TweetTombstone", "TweetUnavailable"):
+                focal_unavailable = True
+            else:
+                meta = self._extract_focal_meta(single_res, focal_tweet_id)
+                if meta:
+                    self.last_focal_tweet_meta = meta
+                    focal_found = True
+
+        replies: List[NormalizedComment] = []
+        next_cursor: Optional[str] = None
+        seen_ids = set()
+
+        for inst in instructions:
+            entries = inst.get("entries") or []
+            if inst.get("entry"):
+                entries = [inst["entry"]]
+            for entry in entries:
+                entry_id = str(entry.get("entryId") or "")
+                content = entry.get("content") or {}
+
+                if entry_id.startswith("cursor-bottom-") or (
+                    content.get("cursorType") in ("Bottom", "ShowMoreThreads", "ShowMoreThreadsPrompt")
+                ):
+                    val = (content.get("itemContent") or {}).get("value") or content.get("value")
+                    if val:
+                        next_cursor = val
+
+                # Direct itemContent (could be focal tweet or single tweet)
+                item_content = content.get("itemContent") or {}
+                tweet_res = (item_content.get("tweet_results") or {}).get("result")
+                if tweet_res:
+                    if entry_id == f"tweet-{focal_tweet_id}" or str(tweet_res.get("rest_id")) == str(focal_tweet_id):
+                        if tweet_res.get("__typename") in ("TweetTombstone", "TweetUnavailable"):
+                            focal_unavailable = True
+                        else:
+                            meta = self._extract_focal_meta(tweet_res, focal_tweet_id)
+                            if meta:
+                                self.last_focal_tweet_meta = meta
+                                focal_found = True
+                                if meta.get("text"):
+                                    target.title_or_name = f"X {meta['author']}: {meta['text'][:80]}"
+                    else:
+                        norm = self._extract_tweet_result(tweet_res, focal_tweet_id, source_title=target.title_or_name)
+                        if norm and norm.external_comment_id not in seen_ids:
+                            seen_ids.add(norm.external_comment_id)
+                            replies.append(norm)
+
+                # Threaded module items (conversationthread-*)
+                for mod_item in content.get("items") or []:
+                    mod_ic = (mod_item.get("item") or {}).get("itemContent") or {}
+                    if mod_ic.get("itemType") == "TimelineTimelineCursor" or mod_ic.get("__typename") == "TimelineTimelineCursor":
+                        continue
+                    mod_tr = (mod_ic.get("tweet_results") or {}).get("result")
+                    if mod_tr:
+                        if str(mod_tr.get("rest_id")) == str(focal_tweet_id):
+                            meta = self._extract_focal_meta(mod_tr, focal_tweet_id)
+                            if meta:
+                                self.last_focal_tweet_meta = meta
+                                focal_found = True
+                                if meta.get("text"):
+                                    target.title_or_name = f"X {meta['author']}: {meta['text'][:80]}"
+                        else:
+                            norm = self._extract_tweet_result(mod_tr, focal_tweet_id, source_title=target.title_or_name)
+                            if norm and norm.external_comment_id not in seen_ids:
+                                seen_ids.add(norm.external_comment_id)
+                                replies.append(norm)
+
+        if focal_unavailable and not focal_found:
+            raise ScraperError("tweet not found", f"Tweet {focal_tweet_id} is unavailable or deleted", status_code=404)
+
+        # Check explicit GraphQL errors if focal tweet wasn't found
+        if not focal_found and not replies:
+            for err in errors:
+                code = err.get("code")
+                msg = (err.get("message") or "").lower()
+                if code in (32, 64, 135, 215, 326, 353) or "authenticate" in msg or "csrf" in msg or "token" in msg:
+                    raise ScraperError("x session rejected", err.get("message") or "X session rejected", status_code=401)
+                if code == 88 or "rate limit" in msg:
+                    raise ScraperError("rate limited", err.get("message") or "X rate limit exceeded", status_code=429)
+                if code in (34, 144, 179, 421) or "no status found" in msg or "not found" in msg:
+                    raise ScraperError("tweet not found", f"Tweet {focal_tweet_id} not found", status_code=404)
+
+        return focal_found, replies, next_cursor
+
+    async def _refresh_ct0_cookie(
+        self,
+        cookies: Dict[str, str],
+        user_agent: str,
+        proxy_url: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Ensure ct0 CSRF cookie is present and fresh by making a lightweight authenticated request to X."""
+        updated = dict(cookies)
+        headers = {
+            "authorization": X_PUBLIC_WEB_BEARER,
+            "user-agent": user_agent,
+            "x-twitter-active-user": "yes",
+            "x-twitter-auth-type": "OAuth2Session",
+            "x-twitter-client-language": "en",
+            "Referer": "https://x.com/home",
+        }
+        if updated.get("ct0"):
+            headers["x-csrf-token"] = updated["ct0"]
+
+        try:
+            async with httpx.AsyncClient(
+                cookies=updated,
+                proxy=proxy_url,
+                headers=headers,
+                timeout=15.0,
+                follow_redirects=True,
+            ) as client:
+                # Hit x.com/manifest.json or settings endpoint to let X issue/rotate ct0 cookie
+                resp = await client.get("https://x.com/i/api/1.1/account/settings.json")
+                for k, v in client.cookies.items():
+                    updated[k] = v
+                for k, v in resp.cookies.items():
+                    updated[k] = v
+                if resp.status_code in (401, 403):
+                    body_text = resp.text.lower()
+                    # Code 32 = Could not authenticate you (invalid/expired auth_token)
+                    if '"code":32' in body_text or '"code": 32' in body_text or "could not authenticate" in body_text:
+                        raise ScraperError("x session rejected", "X auth_token cookie is invalid or expired (code 32)", status_code=401)
+        except ScraperError:
+            raise
+        except Exception as e:
+            logger.debug("ct0 pre-flight refresh check skipped", error=str(e))
+
+        return updated
+
+    async def _fetch_via_twikit(
+        self,
+        tweet_id: str,
+        target: MonitoredTarget,
+        cookies: Dict[str, str],
+        user_agent: str,
+        proxy_url: Optional[str],
+        cursor: Optional[str],
+        limit: int,
+    ) -> Tuple[bool, List[NormalizedComment], Optional[Dict[str, str]]]:
+        """Attempt fetching tweet + replies via twikit Client (handles ct0 & transaction headers)."""
+        _patch_twikit_transaction()
+        from twikit import Client as TwikitClient
+        from twikit.errors import Unauthorized, Forbidden, NotFound, TooManyRequests, AccountLocked, AccountSuspended
+
+        tw_client = TwikitClient(language="en-US", proxy=proxy_url, user_agent=user_agent)
+        tw_client.set_cookies(cookies)
+
+        collected: List[NormalizedComment] = []
+        focal_found = False
+
+        try:
+            current_cursor = cursor
+            pages = 0
+            max_pages = max(1, (limit // 20) + 1)
+
+            while len(collected) < limit and pages < max_pages:
+                pages += 1
+                res_tuple = await tw_client.gql.tweet_detail(tweet_id, cursor=current_cursor)
+                data = res_tuple[0] if isinstance(res_tuple, tuple) else res_tuple
+                if not isinstance(data, dict):
+                    break
+
+                page_focal, page_replies, next_cursor = self._parse_tweet_detail_payload(data, tweet_id, target)
+                if page_focal:
+                    focal_found = True
+                for r in page_replies:
+                    if len(collected) < limit:
+                        collected.append(r)
+
+                if not next_cursor or next_cursor == current_cursor:
+                    break
+                current_cursor = next_cursor
+
+            new_cookies = tw_client.get_cookies()
+            return focal_found, collected, new_cookies
+
+        except (Unauthorized, Forbidden, AccountLocked, AccountSuspended) as auth_err:
+            raise ScraperError("x session rejected", f"X session rejected: {auth_err}", status_code=401)
+        except TooManyRequests as rl_err:
+            raise ScraperError("rate limited", f"X rate limited: {rl_err}", status_code=429)
+        except NotFound as nf_err:
+            raise ScraperError("tweet not found", f"Tweet {tweet_id} not found: {nf_err}", status_code=404)
+
+    async def _fetch_via_playwright(
+        self,
+        tweet_id: str,
+        target: MonitoredTarget,
+        cookies: Dict[str, str],
+        user_agent: str,
+        proxy_url: Optional[str],
+        limit: int,
+    ) -> Tuple[bool, List[NormalizedComment]]:
+        """Fallback: Use headless Chromium with injected session cookies to intercept X's TweetDetail GraphQL JSON."""
+        from playwright.async_api import async_playwright
+
+        intercepted_payloads: List[Dict[str, Any]] = []
+        auth_failed = False
+        rate_limited = False
+
+        pw_cookies = []
+        for name, val in cookies.items():
+            if not val:
+                continue
+            for domain in (".x.com", ".twitter.com"):
+                pw_cookies.append(
+                    {
+                        "name": str(name),
+                        "value": str(val),
+                        "domain": domain,
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": name == "auth_token",
+                        "sameSite": "Lax",
+                    }
+                )
+
+        proxy_cfg = {"server": proxy_url} if proxy_url else None
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, proxy=proxy_cfg)
+            try:
+                context = await browser.new_context(user_agent=user_agent)
+                await context.add_cookies(pw_cookies)
+                page = await context.new_page()
+
+                async def handle_response(response):
+                    nonlocal auth_failed, rate_limited
+                    if "TweetDetail" in response.url or "TweetResultByRestId" in response.url:
+                        if response.status in (401, 403):
+                            auth_failed = True
+                        elif response.status == 429:
+                            rate_limited = True
+                        elif response.status == 200:
+                            try:
+                                body_json = await response.json()
+                                intercepted_payloads.append(body_json)
+                            except Exception:
+                                pass
+
+                page.on("response", handle_response)
+                await page.goto(f"https://x.com/i/status/{tweet_id}", wait_until="domcontentloaded", timeout=25000)
+                await page.wait_for_timeout(3500)
+
+                if "/login" in page.url or "/i/flow/login" in page.url:
+                    raise ScraperError("x session rejected", "X redirected to login flow (session cookies expired)", status_code=401)
+
+                page_text = await page.content()
+                if "Hmm...this page doesn’t exist" in page_text or "Hmm...this page doesn't exist" in page_text:
+                    raise ScraperError("tweet not found", f"Tweet {tweet_id} does not exist", status_code=404)
+            finally:
+                await browser.close()
+
+        if rate_limited and not intercepted_payloads:
+            raise ScraperError("rate limited", "X rate limit exceeded (HTTP 429)", status_code=429)
+        if auth_failed and not intercepted_payloads:
+            raise ScraperError("x session rejected", "X session rejected (HTTP 401/403)", status_code=401)
+
+        focal_found = False
+        collected: List[NormalizedComment] = []
+        seen_ids = set()
+
+        for payload in intercepted_payloads:
+            p_focal, p_replies, _ = self._parse_tweet_detail_payload(payload, tweet_id, target)
+            if p_focal:
+                focal_found = True
+            for r in p_replies:
+                if r.external_comment_id not in seen_ids and len(collected) < limit:
+                    seen_ids.add(r.external_comment_id)
+                    collected.append(r)
+
+        return focal_found, collected
 
     async def fetch_comments(
         self,
@@ -176,118 +672,176 @@ class TwitterXCollector(BaseCollector):
         cursor: Optional[str] = None,
         limit: int = 5000,
     ) -> AsyncIterator[NormalizedComment]:
-        """Paginate replies to an X post using API v2 Bearer Token or GraphQL Burner Session."""
-        tweet_id = target.external_id
+        """Paginate replies to an X post using Burner Session Cookies (twikit / GraphQL / Playwright) or API v2."""
+        tweet_id = str(target.external_id).strip()
+        self.last_focal_tweet_meta = None
         total_yielded = 0
 
-        # Engine 1: Official X API v2 Bearer Token (if configured)
-        if self.bearer_token:
-            async for comment in self._fetch_api_v2_replies(tweet_id=tweet_id, cursor=cursor, limit=limit):
-                yield comment
-                total_yielded += 1
-            if total_yielded > 0:
+        # Engine 1: Burner Session Cookies (Preferred when registered in scraper_sessions)
+        session_tuple = None
+        if self.pool_manager:
+            session_tuple = await self.pool_manager.acquire_session("x")
+
+        if session_tuple:
+            session_obj, raw_cookies, proxy_url = session_tuple
+            cookies: Dict[str, str] = {}
+            if isinstance(raw_cookies, dict):
+                cookies = {str(k): str(v) for k, v in raw_cookies.items() if v is not None}
+            elif isinstance(raw_cookies, str):
+                for part in raw_cookies.split(";"):
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        cookies[k.strip()] = v.strip()
+                if not cookies and raw_cookies.strip():
+                    cookies["auth_token"] = raw_cookies.strip()
+
+            user_agent = (
+                session_obj.user_agent
+                or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+
+            try:
+                # 1a. Refresh/obtain ct0 cookie if missing or stale
+                cookies = await self._refresh_ct0_cookie(cookies, user_agent=user_agent, proxy_url=proxy_url)
+                if self.pool_manager and cookies.get("ct0"):
+                    await self.pool_manager.update_session_cookies(session_obj.id, cookies)
+
+                # 1b. Try twikit Client first
+                focal_found = False
+                replies: List[NormalizedComment] = []
+                try:
+                    focal_found, replies, rotated_cookies = await self._fetch_via_twikit(
+                        tweet_id=tweet_id,
+                        target=target,
+                        cookies=cookies,
+                        user_agent=user_agent,
+                        proxy_url=proxy_url,
+                        cursor=cursor,
+                        limit=limit,
+                    )
+                    if rotated_cookies and self.pool_manager:
+                        cookies.update({str(k): str(v) for k, v in rotated_cookies.items() if v})
+                        await self.pool_manager.update_session_cookies(session_obj.id, cookies)
+                except ScraperError:
+                    raise
+                except Exception as tw_err:
+                    logger.warning("twikit fetch failed; trying direct GraphQL with full FEATURES", error=str(tw_err))
+
+                # 1c. Direct GraphQL with full X_GRAPHQL_FEATURES & candidate query IDs
+                if not focal_found and not replies:
+                    headers = {
+                        "authorization": X_PUBLIC_WEB_BEARER,
+                        "x-csrf-token": cookies.get("ct0", ""),
+                        "x-twitter-active-user": "yes",
+                        "x-twitter-auth-type": "OAuth2Session",
+                        "x-twitter-client-language": "en",
+                        "user-agent": user_agent,
+                        "content-type": "application/json",
+                        "Referer": f"https://x.com/i/status/{tweet_id}",
+                    }
+                    candidate_qids = [self.query_id] + [q for q in X_TWEET_DETAIL_QUERY_IDS if q != self.query_id]
+                    current_cursor = cursor
+                    last_status = None
+
+                    async with httpx.AsyncClient(cookies=cookies, proxy=proxy_url, headers=headers, timeout=25.0) as client:
+                        for qid in candidate_qids:
+                            url = f"https://x.com/i/api/graphql/{qid}/TweetDetail"
+                            page_loop = 0
+                            while len(replies) < limit and page_loop < max(1, (limit // 20) + 1):
+                                page_loop += 1
+                                variables: Dict[str, Any] = {
+                                    "focalTweetId": tweet_id,
+                                    "with_rux_injections": False,
+                                    "includePromotedContent": True,
+                                    "withCommunity": True,
+                                    "withQuickPromoteEligibilityTweetFields": True,
+                                    "withBirdwatchNotes": True,
+                                    "withVoice": True,
+                                    "withV2Timeline": True,
+                                }
+                                if current_cursor:
+                                    variables["cursor"] = current_cursor
+
+                                params = {
+                                    "variables": json.dumps(variables),
+                                    "features": json.dumps(X_GRAPHQL_FEATURES),
+                                    "fieldToggles": json.dumps({"withAuxiliaryUserLabels": False}),
+                                }
+                                resp = await client.get(url, params=params)
+                                last_status = resp.status_code
+
+                                # Update ct0 if X rotated it
+                                if "ct0" in resp.cookies:
+                                    cookies["ct0"] = resp.cookies["ct0"]
+                                    client.headers["x-csrf-token"] = cookies["ct0"]
+
+                                if resp.status_code == 429:
+                                    raise ScraperError("rate limited", "X rate limit exceeded (HTTP 429)", status_code=429)
+                                if resp.status_code in (401, 403):
+                                    raise ScraperError(
+                                        "x session rejected",
+                                        f"X GraphQL rejected session (HTTP {resp.status_code})",
+                                        status_code=401,
+                                    )
+                                if resp.status_code in (400, 404):
+                                    # Stale query_id or missing transaction header — try next query_id
+                                    break
+                                if resp.status_code != 200:
+                                    break
+
+                                data = resp.json()
+                                p_focal, p_replies, next_cursor = self._parse_tweet_detail_payload(data, tweet_id, target)
+                                if p_focal:
+                                    focal_found = True
+                                replies.extend(p_replies)
+                                if not next_cursor or next_cursor == current_cursor:
+                                    break
+                                current_cursor = next_cursor
+
+                            if focal_found or replies:
+                                break
+
+                    # 1d. If direct HTTP got blocked (e.g. 404/400 due to missing browser X-Client-Transaction-Id), use Playwright fallback
+                    if not focal_found and not replies and last_status in (400, 404, 500, None):
+                        try:
+                            focal_found, replies = await self._fetch_via_playwright(
+                                tweet_id=tweet_id,
+                                target=target,
+                                cookies=cookies,
+                                user_agent=user_agent,
+                                proxy_url=proxy_url,
+                                limit=limit,
+                            )
+                        except ScraperError:
+                            raise
+                        except Exception as pw_err:
+                            logger.warning("Playwright X fallback failed", error=str(pw_err))
+
+                if not focal_found and not replies:
+                    raise ScraperError("tweet not found", f"Tweet {tweet_id} not found or unavailable", status_code=404)
+
+                for comment in replies[:limit]:
+                    yield comment
+                    total_yielded += 1
                 return
 
-        # Engine 2: GraphQL TweetDetail with Burner Session Cookies (auth_token + ct0)
-        if not self.pool_manager:
-            logger.warning("No pool manager configured for X scraper; skipping")
+            except ScraperError as s_err:
+                if s_err.error_code == "x session rejected" and self.pool_manager:
+                    await self.pool_manager.report_session_error(session_obj.id)
+                elif s_err.error_code == "rate limited" and self.pool_manager:
+                    await self.pool_manager.report_rate_limit(session_obj.id, cooldown_minutes=15)
+                raise
+
+        # Engine 2: Official X API v2 Bearer Token (if no active burner session or as configured)
+        if self.bearer_token:
+            async for comment in self._fetch_api_v2_replies(
+                tweet_id=tweet_id,
+                target=target,
+                cursor=cursor,
+                limit=limit,
+            ):
+                yield comment
+                total_yielded += 1
             return
 
-        session_tuple = await self.pool_manager.acquire_session("x")
-        if not session_tuple:
-            logger.warning("No active X burner session or X_BEARER_TOKEN found.")
-            return
-
-        session_obj, cookies, proxy_url = session_tuple
-        if isinstance(cookies, str):
-            # Support raw cookie string or single auth_token
-            parsed_cookies: Dict[str, str] = {}
-            for part in cookies.split(";"):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    parsed_cookies[k.strip()] = v.strip()
-            if not parsed_cookies:
-                parsed_cookies["auth_token"] = cookies.strip()
-            cookies = parsed_cookies
-
-        headers = {
-            "authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
-            "x-csrf-token": cookies.get("ct0", ""),
-            "x-twitter-active-user": "yes",
-            "x-twitter-auth-type": "OAuth2Session",
-            "x-twitter-client-language": "en",
-            "user-agent": session_obj.user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "content-type": "application/json",
-            "Referer": f"https://x.com/i/status/{tweet_id}",
-        }
-
-        current_cursor = cursor
-        async with httpx.AsyncClient(cookies=cookies, proxy=proxy_url, headers=headers, timeout=25.0) as client:
-            while total_yielded < limit:
-                variables = {
-                    "focalTweetId": tweet_id,
-                    "with_rux_injections": False,
-                    "includePromotedContent": False,
-                    "withCommunity": False,
-                    "withQuickPromoteEligibilityTweetFields": False,
-                    "withBirdwatchNotes": False,
-                    "withVoice": False,
-                    "withV2Timeline": True,
-                }
-                if current_cursor:
-                    variables["cursor"] = current_cursor
-
-                params = {
-                    "variables": json.dumps(variables),
-                    "features": json.dumps({"responsive_web_graphql_timeline_navigation_enabled": True}),
-                }
-
-                url = f"https://x.com/i/api/graphql/{self.query_id}/TweetDetail"
-                try:
-                    resp = await client.get(url, params=params)
-                    if resp.status_code == 429:
-                        await self.pool_manager.report_rate_limit(session_obj.id, cooldown_minutes=15)
-                        break
-                    if resp.status_code != 200:
-                        logger.error("X GraphQL request returned status", status=resp.status_code)
-                        break
-
-                    data = resp.json()
-                    instructions = data.get("data", {}).get("threaded_conversation_with_injections_v2", {}).get("instructions", [])
-                    next_cursor = None
-
-                    for inst in instructions:
-                        entries = inst.get("entries", [])
-                        for entry in entries:
-                            entry_id = entry.get("entryId", "")
-                            content = entry.get("content") or {}
-
-                            if entry_id.startswith("cursor-bottom-"):
-                                next_cursor = (content.get("itemContent") or {}).get("value") or content.get("value")
-
-                            # Direct itemContent
-                            item_content = content.get("itemContent") or {}
-                            tweet_res = (item_content.get("tweet_results") or {}).get("result")
-                            if tweet_res:
-                                norm = self._extract_tweet_result(tweet_res, tweet_id)
-                                if norm:
-                                    yield norm
-                                    total_yielded += 1
-
-                            # Threaded module items (conversationthreads)
-                            for mod_item in content.get("items") or []:
-                                mod_ic = (mod_item.get("item") or {}).get("itemContent") or {}
-                                mod_tr = (mod_ic.get("tweet_results") or {}).get("result")
-                                if mod_tr:
-                                    norm = self._extract_tweet_result(mod_tr, tweet_id)
-                                    if norm:
-                                        yield norm
-                                        total_yielded += 1
-
-                    if not next_cursor or next_cursor == current_cursor:
-                        break
-                    current_cursor = next_cursor
-
-                except Exception as e:
-                    logger.error("X scraper iteration failed", error=str(e))
-                    break
+        raise ScraperError("no x session configured", "No active X burner session or X_BEARER_TOKEN configured", status_code=409)

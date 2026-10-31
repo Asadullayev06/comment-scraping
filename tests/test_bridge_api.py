@@ -317,3 +317,272 @@ async def test_bridge_x_409_and_detailed_health(bridge_client):
     h_resp2 = await bridge_client.get("/health/detailed")
     h_data2 = await h_resp2.json()
     assert h_data2["platforms_ready"]["x"] is True
+
+
+@pytest.mark.asyncio
+async def test_bridge_x_scrape_replies_and_explicit_errors(bridge_client, monkeypatch):
+    """Verify X scraper fetches replies, runs DeepSeek evaluation, and returns explicit errors (401/404/429) while incrementing error_count."""
+    from src.collectors.twitter_x import TwitterXCollector
+    from src.llm.processor import MicroBatchProcessor
+
+    # 1. Seed X burner session
+    await bridge_client.post(
+        "/api/sessions",
+        json={
+            "platform": "x",
+            "account": "x_burner_test",
+            "cookies": {"auth_token": "valid_auth", "ct0": "valid_ct0"},
+        },
+    )
+
+    async def mock_refresh_ct0(self, cookies, user_agent, proxy_url=None):
+        return cookies
+
+    monkeypatch.setattr(TwitterXCollector, "_refresh_ct0_cookie", mock_refresh_ct0)
+
+    # Mock twikit response for a tweet with 2 replies (1 long hostile reply, 1 short emoji noise reply)
+    async def mock_fetch_via_twikit(self, tweet_id, target, cookies, user_agent, proxy_url, cursor, limit):
+        if tweet_id == "2111136681747452363":
+            sample_gql = {
+                "data": {
+                    "threaded_conversation_with_injections_v2": {
+                        "instructions": [
+                            {
+                                "type": "TimelineAddEntries",
+                                "entries": [
+                                    {
+                                        "entryId": f"tweet-{tweet_id}",
+                                        "content": {
+                                            "itemContent": {
+                                                "tweet_results": {
+                                                    "result": {
+                                                        "__typename": "Tweet",
+                                                        "rest_id": tweet_id,
+                                                        "core": {
+                                                            "user_results": {
+                                                                "result": {
+                                                                    "rest_id": "u_author",
+                                                                    "legacy": {
+                                                                        "screen_name": "AsliddinKamalov",
+                                                                        "name": "Asliddin Kamalov",
+                                                                    },
+                                                                }
+                                                            }
+                                                        },
+                                                        "legacy": {
+                                                            "id_str": tweet_id,
+                                                            "full_text": "Focal tweet text for testing X replies.",
+                                                            "created_at": "Wed Oct 28 12:00:00 +0000 2026",
+                                                            "favorite_count": 42,
+                                                            "reply_count": 2,
+                                                        },
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    },
+                                    {
+                                        "entryId": "conversationthread-101",
+                                        "content": {
+                                            "items": [
+                                                {
+                                                    "item": {
+                                                        "itemContent": {
+                                                            "tweet_results": {
+                                                                "result": {
+                                                                    "__typename": "Tweet",
+                                                                    "rest_id": "999001",
+                                                                    "core": {
+                                                                        "user_results": {
+                                                                            "result": {
+                                                                                "rest_id": "u_replier_1",
+                                                                                "legacy": {
+                                                                                    "screen_name": "angry_critic",
+                                                                                    "name": "Angry Critic",
+                                                                                },
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    "legacy": {
+                                                                        "id_str": "999001",
+                                                                        "full_text": "All these officials are corrupt thieves stealing public money every single day!",
+                                                                        "created_at": "Wed Oct 28 12:05:00 +0000 2026",
+                                                                        "favorite_count": 5,
+                                                                        "reply_count": 0,
+                                                                    },
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                                {
+                                                    "item": {
+                                                        "itemContent": {
+                                                            "tweet_results": {
+                                                                "result": {
+                                                                    "__typename": "Tweet",
+                                                                    "rest_id": "999002",
+                                                                    "core": {
+                                                                        "user_results": {
+                                                                            "result": {
+                                                                                "rest_id": "u_replier_2",
+                                                                                "legacy": {
+                                                                                    "screen_name": "emoji_fan",
+                                                                                    "name": "Emoji Fan",
+                                                                                },
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    "legacy": {
+                                                                        "id_str": "999002",
+                                                                        "full_text": "🔥🔥🔥",
+                                                                        "created_at": "Wed Oct 28 12:06:00 +0000 2026",
+                                                                        "favorite_count": 1,
+                                                                        "reply_count": 0,
+                                                                    },
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                            ]
+                                        },
+                                    },
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+            focal, replies, _ = self._parse_tweet_detail_payload(sample_gql, tweet_id, target)
+            return focal, replies, cookies
+
+        if tweet_id == "2113589268937421273":
+            # Tweet that genuinely has 0 replies
+            zero_gql = {
+                "data": {
+                    "threaded_conversation_with_injections_v2": {
+                        "instructions": [
+                            {
+                                "type": "TimelineAddEntries",
+                                "entries": [
+                                    {
+                                        "entryId": f"tweet-{tweet_id}",
+                                        "content": {
+                                            "itemContent": {
+                                                "tweet_results": {
+                                                    "result": {
+                                                        "__typename": "Tweet",
+                                                        "rest_id": tweet_id,
+                                                        "core": {
+                                                            "user_results": {
+                                                                "result": {
+                                                                    "rest_id": "u_ozodlik",
+                                                                    "legacy": {"screen_name": "ozodlik", "name": "Ozodlik"},
+                                                                }
+                                                            }
+                                                        },
+                                                        "legacy": {
+                                                            "id_str": tweet_id,
+                                                            "full_text": "Post with zero replies.",
+                                                            "created_at": "Wed Oct 28 13:00:00 +0000 2026",
+                                                            "favorite_count": 10,
+                                                            "reply_count": 0,
+                                                        },
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+            focal, replies, _ = self._parse_tweet_detail_payload(zero_gql, tweet_id, target)
+            return focal, replies, cookies
+
+        if tweet_id == "9999999999999999999":
+            from src.collectors.base import ScraperError
+            raise ScraperError("tweet not found", f"Tweet {tweet_id} not found", status_code=404)
+
+        if tweet_id == "8888888888888888888":
+            from src.collectors.base import ScraperError
+            raise ScraperError("x session rejected", "X session rejected or cookies expired", status_code=401)
+
+        return False, [], cookies
+
+    monkeypatch.setattr(TwitterXCollector, "_fetch_via_twikit", mock_fetch_via_twikit)
+
+    # Mock LLM evaluation for the hostile reply
+    from src.llm.client import DeepSeekClassifier
+    from src.schemas.llm import CommentVerdict
+
+    async def mock_evaluate_batch(self, items, source_context="Public Social Media Post"):
+        return (
+            [
+                CommentVerdict(
+                    id=item.id,
+                    on_topic=True,
+                    severely_negative=True,
+                    severity_score=8,
+                    reason="Direct corruption accusation against officials.",
+                )
+                for item in items
+            ],
+            {},
+        )
+
+    monkeypatch.setattr(DeepSeekClassifier, "evaluate_batch", mock_evaluate_batch)
+
+    # 2. Test X post with replies -> newly_ingested=2, noise_skipped=1, evaluated=1, flagged_count=1
+    resp1 = await bridge_client.post(
+        "/api/scrape",
+        json={"url": "https://x.com/AsliddinKamalov/status/2111136681747452363"},
+    )
+    assert resp1.status == 200
+    data1 = await resp1.json()
+    assert data1["scrape_result"]["status"] == "completed"
+    assert data1["scrape_result"]["newly_ingested"] == 2
+    assert data1["stats"]["total_comments"] == 2
+    assert data1["stats"]["noise_skipped"] == 1
+    assert data1["stats"]["evaluated"] == 1
+    assert data1["stats"]["flagged_count"] == 1
+    assert data1["tweet"]["author"] == "@AsliddinKamalov"
+    assert len(data1["flagged_comments"]) == 1
+    assert data1["flagged_comments"][0]["score"] == 8
+
+    # 3. Test X post with genuinely 0 replies -> status="completed", total_comments=0
+    resp2 = await bridge_client.post(
+        "/api/scrape",
+        json={"url": "https://x.com/ozodlik/status/2113589268937421273"},
+    )
+    assert resp2.status == 200
+    data2 = await resp2.json()
+    assert data2["scrape_result"]["status"] == "completed"
+    assert data2["stats"]["total_comments"] == 0
+    assert data2["tweet"]["author"] == "@ozodlik"
+
+    # 4. Test non-existent/deleted tweet -> HTTP 404 {"error": "tweet not found"}
+    resp3 = await bridge_client.post(
+        "/api/scrape",
+        json={"url": "https://x.com/someone/status/9999999999999999999"},
+    )
+    assert resp3.status == 404
+    data3 = await resp3.json()
+    assert data3["error"] == "tweet not found"
+
+    # 5. Test rejected X session -> HTTP 401 {"error": "x session rejected"} and error_count incremented
+    resp4 = await bridge_client.post(
+        "/api/scrape",
+        json={"url": "https://x.com/someone/status/8888888888888888888"},
+    )
+    assert resp4.status == 401
+    data4 = await resp4.json()
+    assert data4["error"] == "x session rejected"
+
+    sess_resp = await bridge_client.get("/api/sessions?platform=x")
+    sess_data = await sess_resp.json()
+    assert sess_data["sessions"][0]["error_count"] == 1
+
