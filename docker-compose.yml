@@ -49,6 +49,7 @@ services:
       - LLM_BATCH_FLUSH_SECONDS=${LLM_BATCH_FLUSH_SECONDS:-4.0}
       - LLM_ALERT_SEVERITY_THRESHOLD=${LLM_ALERT_SEVERITY_THRESHOLD:-7}
       - YOUTUBE_API_KEY=${YOUTUBE_API_KEY:-}
+      - X_BEARER_TOKEN=${X_BEARER_TOKEN:-}
       - X_TWEET_DETAIL_QUERY_ID=${X_TWEET_DETAIL_QUERY_ID:-V94IR8nUKvgjwjd8uKnogg}
       - FB_COMET_DOC_ID=${FB_COMET_DOC_ID:-5959580457497184}
       - OPS_API_PORT=18890
@@ -76,6 +77,7 @@ services:
       - DATABASE_URL=postgresql+asyncpg://operatives:strongpassword@postgres:5432/operatives_db
       - REDIS_URL=redis://redis:6379/0
       - YOUTUBE_API_KEY=${YOUTUBE_API_KEY}
+      - X_BEARER_TOKEN=${X_BEARER_TOKEN:-}
       - SESSION_ENCRYPTION_KEY=${SESSION_ENCRYPTION_KEY}
     shm_size: '2gb'
     depends_on:
