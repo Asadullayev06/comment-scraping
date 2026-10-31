@@ -653,6 +653,37 @@ async def _execute_profile_analysis(
             )
 
     if not recent_posts:
+        if profile_meta and profile_meta.get("followers") is not None:
+            return (
+                {
+                    "profile": profile_meta,
+                    "cadence_and_engagement": {
+                        "posts_analyzed": 0,
+                        "avg_likes_per_post": 0,
+                        "avg_comments_per_post": 0,
+                        "newest_post_at": None,
+                        "oldest_post_at": None,
+                    },
+                    "posts": [],
+                    "comment_stats": {
+                        "total_stored": 0,
+                        "newly_ingested": 0,
+                        "evaluated": 0,
+                        "noise_skipped": 0,
+                        "flagged_count": 0,
+                        "score_distribution": {
+                            "0_1_benign": 0,
+                            "2_3_venting": 0,
+                            "4_6_cynical_or_claims": 0,
+                            "7_8_hostile": 0,
+                            "9_10_critical": 0,
+                        },
+                    },
+                    "flagged_comments": [],
+                    "top_comments_sample": [],
+                },
+                200,
+            )
         return None, 404
 
     selected_posts = recent_posts[:posts_count]

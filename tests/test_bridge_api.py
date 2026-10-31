@@ -587,42 +587,100 @@ async def test_bridge_x_scrape_replies_and_explicit_errors(bridge_client, monkey
     assert sess_data["sessions"][0]["error_count"] == 1
 
     # 6. Test X profile enumeration + multi-post reply analysis (/api/profile and /api/posts on https://x.com/ozodlik)
+    collector_inst = TwitterXCollector()
+    sample_user_gql = {
+        "data": {
+            "user": {
+                "result": {
+                    "__typename": "User",
+                    "rest_id": "12345678",
+                    "is_blue_verified": True,
+                    "core": {
+                        "screen_name": "ozodlik",
+                        "name": "Ozodlik Radiosi",
+                    },
+                    "legacy": {
+                        "description": "Official X news account",
+                        "followers_count": 120000,
+                        "friends_count": 150,
+                        "statuses_count": 45000,
+                    },
+                }
+            }
+        }
+    }
+    uid, parsed_u_meta = collector_inst._parse_user_by_screen_name_payload(sample_user_gql, "ozodlik")
+    assert uid == "12345678"
+    assert parsed_u_meta["username"] == "@ozodlik"
+    assert parsed_u_meta["followers"] == 120000
+
+    sample_tweets_gql = {
+        "data": {
+            "user": {
+                "result": {
+                    "timeline_v2": {
+                        "timeline": {
+                            "instructions": [
+                                {
+                                    "type": "TimelineAddEntries",
+                                    "entries": [
+                                        {
+                                            "entryId": "tweet-2111136681747452363",
+                                            "content": {
+                                                "itemContent": {
+                                                    "tweet_results": {
+                                                        "result": {
+                                                            "__typename": "Tweet",
+                                                            "rest_id": "2111136681747452363",
+                                                            "legacy": {
+                                                                "id_str": "2111136681747452363",
+                                                                "full_text": "First recent X post",
+                                                                "created_at": "Wed Oct 28 12:00:00 +0000 2026",
+                                                                "reply_count": 2,
+                                                                "favorite_count": 42,
+                                                                "retweet_count": 5,
+                                                            },
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        },
+                                        {
+                                            "entryId": "tweet-2113589268937421273",
+                                            "content": {
+                                                "itemContent": {
+                                                    "tweet_results": {
+                                                        "result": {
+                                                            "__typename": "Tweet",
+                                                            "rest_id": "2113589268937421273",
+                                                            "legacy": {
+                                                                "id_str": "2113589268937421273",
+                                                                "full_text": "Second recent X post",
+                                                                "created_at": "Wed Oct 28 13:00:00 +0000 2026",
+                                                                "reply_count": 0,
+                                                                "favorite_count": 10,
+                                                                "retweet_count": 1,
+                                                            },
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        },
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    }
+    parsed_t_list = collector_inst._parse_user_tweets_payload(sample_tweets_gql, "ozodlik", count=5)
+    assert len(parsed_t_list) == 2
+    assert parsed_t_list[0]["shortcode"] == "2111136681747452363"
+
     async def mock_x_profile_info(self, username, count=5):
-        return (
-            {
-                "platform": "x",
-                "username": f"@{username.lstrip('@')}",
-                "url": f"https://x.com/{username.lstrip('@')}",
-                "full_name": "Ozodlik Radiosi",
-                "bio": "Official X news account",
-                "followers": 120000,
-                "following": 150,
-                "total_posts": 45000,
-                "is_verified": True,
-            },
-            [
-                {
-                    "post_index": 1,
-                    "shortcode": "2111136681747452363",
-                    "tweet_id": "2111136681747452363",
-                    "url": "https://x.com/ozodlik/status/2111136681747452363",
-                    "caption": "First recent X post",
-                    "comment_count": 2,
-                    "like_count": 42,
-                    "published_at": "2026-10-28 12:00:00",
-                },
-                {
-                    "post_index": 2,
-                    "shortcode": "2113589268937421273",
-                    "tweet_id": "2113589268937421273",
-                    "url": "https://x.com/ozodlik/status/2113589268937421273",
-                    "caption": "Second recent X post",
-                    "comment_count": 0,
-                    "like_count": 10,
-                    "published_at": "2026-10-28 13:00:00",
-                },
-            ][:count],
-        )
+        return parsed_u_meta, parsed_t_list[:count]
 
     monkeypatch.setattr(TwitterXCollector, "fetch_profile_info_and_posts", mock_x_profile_info)
 
