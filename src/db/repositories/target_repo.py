@@ -44,10 +44,12 @@ class TargetRepository:
         url: Optional[str] = None,
         title_or_name: Optional[str] = None,
         poll_interval_seconds: int = 300,
+        is_active: bool = True,
     ) -> MonitoredTarget:
         existing = await self.get_by_platform_and_external_id(platform, external_id)
         if existing:
-            existing.is_active = True
+            if is_active:
+                existing.is_active = True
             if url:
                 existing.url = url
             if title_or_name:
@@ -62,7 +64,7 @@ class TargetRepository:
             url=url,
             title_or_name=title_or_name,
             poll_interval_seconds=poll_interval_seconds,
-            is_active=True,
+            is_active=is_active,
         )
         self.session.add(target)
         await self.session.flush()

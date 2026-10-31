@@ -59,6 +59,10 @@ async def init_models():
                     "WHERE LOWER(content_text) LIKE '%kimga pul kere%'"
                 )
             )
+            # Deactivate one-off test target DfJp_LaFGCn so it doesn't stay in the background cron schedule
+            await conn.execute(
+                text("UPDATE monitored_targets SET is_active = FALSE WHERE external_id = 'DfJp_LaFGCn'")
+            )
         except Exception as clean_err:
             logger.debug("Optional startup SQL cleanup skipped", error=str(clean_err))
     logger.info("Database tables initialized and calibrated successfully.")

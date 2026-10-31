@@ -1,10 +1,12 @@
 """Lightweight internal HTTP bridge exposing token-safe (< 3 KB) endpoints for Hermes CLI (ops)."""
 
+import asyncio
+import random
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from aiohttp import web
-from sqlalchemy import select, func, desc, or_
+from sqlalchemy import select, func, desc, or_, case, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 import structlog
 
@@ -473,6 +475,348 @@ async def handle_digest(request: web.Request) -> web.Response:
     )
 
 
+async def _fetch_ig_profile_and_posts(
+    ig_collector: InstagramCollector,
+    username: str,
+    count: int = 5,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Fetch profile metadata and recent posts, supporting both full and monkeypatched collectors."""
+    # Check if fetch_profile_recent_posts was monkeypatched on the class/instance in tests
+    if getattr(InstagramCollector.fetch_profile_recent_posts, "__name__", "") != "fetch_profile_recent_posts":
+        posts = await ig_collector.fetch_profile_recent_posts(username, count=count)
+        meta = {
+            "platform": "instagram",
+            "username": f"@{username.lstrip('@')}",
+            "url": f"https://www.instagram.com/{username.lstrip('@')}/",
+            "full_name": username.lstrip("@"),
+            "bio": None,
+            "followers": None,
+            "following": None,
+            "total_posts": len(posts),
+            "is_verified": False,
+        }
+        return meta, posts
+
+    meta, posts = await ig_collector.fetch_profile_info_and_posts(username, count=count)
+    if not posts:
+        posts = await ig_collector.fetch_profile_recent_posts(username, count=count)
+    meta["posts_returned"] = len(posts)
+    return meta, posts
+
+
+async def _execute_profile_analysis(
+    ig_username: str,
+    posts_count: int = 3,
+    per_post_limit: int = 80,
+    scrape_comments: bool = True,
+    monitor: bool = False,
+    mtproto: Optional[Any] = None,
+) -> Tuple[Optional[Dict[str, Any]], int]:
+    """Enumerate an Instagram profile's last N posts, scrape & score comments on each, and aggregate."""
+    posts_count = min(max(1, posts_count), 5)  # Hard cap at 5 posts to protect burner session
+
+    async with async_session_factory() as session:
+        pool_mgr = SessionPoolManager(session)
+        ig_collector = InstagramCollector(pool_mgr)
+        profile_meta, recent_posts = await _fetch_ig_profile_and_posts(
+            ig_collector,
+            ig_username,
+            count=max(5, posts_count),
+        )
+
+    if not recent_posts:
+        return None, 404
+
+    selected_posts = recent_posts[:posts_count]
+    target_ids: List[str] = []
+    post_id_map: Dict[str, str] = {}
+    total_newly_ingested = 0
+    total_evaluated_in_run = 0
+
+    for idx, p in enumerate(selected_posts):
+        shortcode = p["shortcode"]
+        post_url = p["url"]
+        async with async_session_factory() as session:
+            t_repo = TargetRepository(session)
+            target = await t_repo.create_or_activate(
+                platform="instagram",
+                target_type="post_url",
+                external_id=shortcode,
+                url=post_url,
+                title_or_name=f"Instagram @{ig_username} ({shortcode})",
+                is_active=monitor,
+            )
+            await session.commit()
+            t_id = target.id
+            target_ids.append(t_id)
+            post_id_map[shortcode] = t_id
+
+        if scrape_comments:
+            ins, ev = await _execute_inline_scrape(t_id, mtproto=mtproto, limit=per_post_limit)
+            total_newly_ingested += ins
+            total_evaluated_in_run += ev
+            # Safe per-post delay when walking multiple posts with live network calls
+            if idx < len(selected_posts) - 1 and ins > 0:
+                await asyncio.sleep(random.uniform(1.5, 2.5))
+
+    # Build aggregate profile report from PostgreSQL across the analyzed posts
+    threshold = settings.LLM_ALERT_SEVERITY_THRESHOLD
+    async with async_session_factory() as session:
+        posts_summary: List[Dict[str, Any]] = []
+        for p in selected_posts:
+            sc = p["shortcode"]
+            t_id = post_id_map[sc]
+            c_total = (await session.execute(select(func.count(Comment.id)).where(Comment.target_id == t_id))).scalar() or 0
+            c_eval = (
+                await session.execute(
+                    select(func.count(Comment.id)).where(Comment.target_id == t_id, Comment.llm_status == "evaluated")
+                )
+            ).scalar() or 0
+            c_flag = (
+                await session.execute(
+                    select(func.count(Comment.id)).where(Comment.target_id == t_id, Comment.severity_score >= threshold)
+                )
+            ).scalar() or 0
+
+            posts_summary.append(
+                {
+                    "post_index": p["post_index"],
+                    "shortcode": sc,
+                    "url": p["url"],
+                    "published_at": p.get("published_at"),
+                    "ig_comment_count": p.get("comment_count", 0),
+                    "like_count": p.get("like_count", 0),
+                    "scraped_comments": c_total,
+                    "evaluated": c_eval,
+                    "flagged_count": c_flag,
+                    "caption": _truncate(p.get("caption"), 100),
+                }
+            )
+
+        total_stored = (
+            await session.execute(select(func.count(Comment.id)).where(Comment.target_id.in_(target_ids)))
+        ).scalar() or 0
+        total_eval = (
+            await session.execute(
+                select(func.count(Comment.id)).where(Comment.target_id.in_(target_ids), Comment.llm_status == "evaluated")
+            )
+        ).scalar() or 0
+        total_skip = (
+            await session.execute(
+                select(func.count(Comment.id)).where(
+                    Comment.target_id.in_(target_ids), Comment.llm_status == "skipped_prefilter"
+                )
+            )
+        ).scalar() or 0
+        total_flag = (
+            await session.execute(
+                select(func.count(Comment.id)).where(Comment.target_id.in_(target_ids), Comment.severity_score >= threshold)
+            )
+        ).scalar() or 0
+
+        # Score bucket distribution
+        dist_stmt = select(
+            func.sum(case((Comment.severity_score.between(0, 1), 1), else_=0)),
+            func.sum(case((Comment.severity_score.between(2, 3), 1), else_=0)),
+            func.sum(case((Comment.severity_score.between(4, 6), 1), else_=0)),
+            func.sum(case((Comment.severity_score.between(7, 8), 1), else_=0)),
+            func.sum(case((Comment.severity_score >= 9, 1), else_=0)),
+        ).where(Comment.target_id.in_(target_ids), Comment.llm_status == "evaluated")
+        dist_row = (await session.execute(dist_stmt)).first() or (0, 0, 0, 0, 0)
+        score_distribution = {
+            "0_1_benign": int(dist_row[0] or 0),
+            "2_3_venting": int(dist_row[1] or 0),
+            "4_6_cynical_or_claims": int(dist_row[2] or 0),
+            "7_8_hostile": int(dist_row[3] or 0),
+            "9_10_critical": int(dist_row[4] or 0),
+        }
+
+        # Flagged comments across all N posts
+        flag_stmt = (
+            select(Comment, PlatformAuthor)
+            .outerjoin(PlatformAuthor, Comment.author_id == PlatformAuthor.id)
+            .where(Comment.target_id.in_(target_ids), Comment.severity_score >= threshold)
+            .order_by(desc(Comment.severity_score), desc(Comment.published_at))
+            .limit(24)
+        )
+        flag_rows = (await session.execute(flag_stmt)).all()
+        flagged_comments = _cluster_duplicates(
+            [_format_comment(c, a, max_text=140, threshold=threshold) for c, a in flag_rows],
+            limit=10,
+        )
+
+        # Top evaluated comments sample (even if below threshold) so Hermes sees themes & vibe
+        top_stmt = (
+            select(Comment, PlatformAuthor)
+            .outerjoin(PlatformAuthor, Comment.author_id == PlatformAuthor.id)
+            .where(
+                Comment.target_id.in_(target_ids),
+                Comment.llm_status == "evaluated",
+                or_(Comment.severity_score < threshold, Comment.severity_score.is_(None)),
+            )
+            .order_by(desc(Comment.severity_score), desc(Comment.published_at))
+            .limit(16)
+        )
+        top_rows = (await session.execute(top_stmt)).all()
+        top_sample = _cluster_duplicates(
+            [
+                {
+                    "author": _format_author(a),
+                    "score": c.severity_score,
+                    "reason": _truncate(c.llm_reason, 85) if c.llm_reason else None,
+                    "text": _truncate(c.content_text, 110),
+                    "url": c.comment_url or c.post_url,
+                }
+                for c, a in top_rows
+            ],
+            limit=6,
+        )
+
+    avg_likes = int(sum(p.get("like_count", 0) for p in selected_posts) / max(1, len(selected_posts)))
+    avg_comments = int(sum(p.get("comment_count", 0) for p in selected_posts) / max(1, len(selected_posts)))
+
+    return (
+        {
+            "profile": profile_meta,
+            "cadence_and_engagement": {
+                "posts_analyzed": len(selected_posts),
+                "avg_likes_per_post": avg_likes,
+                "avg_comments_per_post": avg_comments,
+                "newest_post_at": selected_posts[0].get("published_at"),
+                "oldest_post_at": selected_posts[-1].get("published_at"),
+            },
+            "posts": posts_summary,
+            "comment_stats": {
+                "total_stored": total_stored,
+                "newly_ingested": total_newly_ingested,
+                "evaluated": total_eval,
+                "noise_skipped": total_skip,
+                "flagged_count": total_flag,
+                "score_distribution": score_distribution,
+            },
+            "flagged_comments": flagged_comments,
+            "top_comments_sample": top_sample,
+        },
+        200,
+    )
+
+
+async def handle_posts(request: web.Request) -> web.Response:
+    """GET /api/posts?target=@handle&count=5 — List recent posts of an Instagram profile without scraping comments."""
+    target_input = (
+        request.query.get("target")
+        or request.query.get("handle")
+        or request.query.get("username")
+        or request.query.get("url")
+        or ""
+    ).strip()
+    count = min(max(1, int(request.query.get("count") or request.query.get("limit") or 5)), 10)
+    ig_username = _extract_instagram_profile_username(target_input)
+    if not ig_username:
+        return web.json_response(
+            {"error": f"Provide a valid Instagram handle or profile URL (got '{target_input}')."},
+            status=400,
+        )
+
+    async with async_session_factory() as session:
+        pool_mgr = SessionPoolManager(session)
+        ig_collector = InstagramCollector(pool_mgr)
+        profile_meta, recent_posts = await _fetch_ig_profile_and_posts(ig_collector, ig_username, count=count)
+        if not recent_posts:
+            return web.json_response(
+                {"error": f"Could not fetch posts for Instagram profile '@{ig_username}'."},
+                status=404,
+            )
+        return web.json_response({"profile": profile_meta, "recent_posts": recent_posts})
+
+
+async def handle_profile(request: web.Request) -> web.Response:
+    """GET/POST /api/profile or /api/scrape/profile — Multi-post profile enumeration, comment scraping, and aggregation."""
+    body = {}
+    if request.can_read_body:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+    raw_handle = (
+        body.get("handle")
+        or body.get("username")
+        or body.get("target")
+        or body.get("url")
+        or request.query.get("handle")
+        or request.query.get("username")
+        or request.query.get("target")
+        or request.query.get("url")
+        or ""
+    ).strip()
+    if not raw_handle:
+        return web.json_response({"error": "Missing required 'handle' or 'target' parameter."}, status=400)
+
+    ig_username = _extract_instagram_profile_username(raw_handle)
+    if not ig_username:
+        return web.json_response(
+            {"error": f"Could not parse Instagram handle from '{raw_handle}'."},
+            status=400,
+        )
+
+    posts_count = min(max(1, int(body.get("posts") or body.get("count") or request.query.get("posts") or request.query.get("count") or 3)), 5)
+    per_post_limit = min(max(10, int(body.get("limit") or request.query.get("limit") or 80)), 300)
+    scrape_param = body.get("scrape", request.query.get("scrape", "true"))
+    scrape_comments = str(scrape_param).lower() not in ("false", "0", "no")
+    monitor_param = body.get("monitor", request.query.get("monitor", "false"))
+    monitor = str(monitor_param).lower() in ("true", "1", "yes")
+
+    mtproto = request.app.get("mtproto")
+    payload, status_code = await _execute_profile_analysis(
+        ig_username=ig_username,
+        posts_count=posts_count,
+        per_post_limit=per_post_limit,
+        scrape_comments=scrape_comments,
+        monitor=monitor,
+        mtproto=mtproto,
+    )
+    if not payload:
+        return web.json_response(
+            {"error": f"Could not fetch profile or posts for '@{ig_username}'."},
+            status=status_code,
+        )
+    return web.json_response(payload)
+
+
+async def handle_delete_target(request: web.Request) -> web.Response:
+    """DELETE/POST /api/target/delete?target=<id_or_shortcode> — Deactivate or remove a target."""
+    body = {}
+    if request.can_read_body:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+    target_input = (body.get("target") or body.get("id") or request.query.get("target") or request.query.get("id") or "").strip()
+    if not target_input:
+        return web.json_response({"error": "Missing 'target' parameter."}, status=400)
+
+    hard_delete = str(body.get("delete", request.query.get("delete", "false"))).lower() in ("true", "1", "yes")
+
+    async with async_session_factory() as session:
+        target = await _resolve_target(session, target_input)
+        if not target:
+            return web.json_response({"error": f"Target '{target_input}' not found."}, status=404)
+
+        t_id = target.id
+        ext_id = target.external_id
+        if hard_delete:
+            await session.execute(delete(MonitoredTarget).where(MonitoredTarget.id == t_id))
+            action = "deleted"
+        else:
+            target.is_active = False
+            action = "deactivated"
+        await session.commit()
+
+    return web.json_response({"status": "ok", "action": action, "target_id": t_id, "external_id": ext_id})
+
+
 async def handle_check(request: web.Request) -> web.Response:
     """GET /api/check?target=<id_or_url_or_@handle>&limit=10"""
     target_input = request.query.get("target", "").strip()
@@ -525,16 +869,11 @@ async def handle_check(request: web.Request) -> web.Response:
         if not target and ig_username:
             pool_mgr = SessionPoolManager(session)
             ig_collector = InstagramCollector(pool_mgr)
-            recent_posts = await ig_collector.fetch_profile_recent_posts(ig_username, count=5)
+            profile_meta, recent_posts = await _fetch_ig_profile_and_posts(ig_collector, ig_username, count=5)
             if recent_posts:
                 return web.json_response(
                     {
-                        "profile": {
-                            "platform": "instagram",
-                            "username": f"@{ig_username}",
-                            "url": f"https://www.instagram.com/{ig_username}/",
-                            "posts_returned": len(recent_posts),
-                        },
+                        "profile": profile_meta,
                         "recent_posts": recent_posts,
                     }
                 )
@@ -564,7 +903,7 @@ async def handle_check(request: web.Request) -> web.Response:
 
 
 async def handle_scrape(request: web.Request) -> web.Response:
-    """POST /api/scrape (body or query: url, post_index=1, wait=true, limit=200)"""
+    """POST /api/scrape (body or query: url, post_index=1, posts=, monitor=false, wait=true, limit=200)"""
     body = {}
     if request.can_read_body:
         try:
@@ -575,8 +914,10 @@ async def handle_scrape(request: web.Request) -> web.Response:
     raw_url = (
         body.get("url")
         or body.get("target")
+        or body.get("handle")
         or request.query.get("url")
         or request.query.get("target")
+        or request.query.get("handle")
         or ""
     ).strip()
     if not raw_url:
@@ -586,16 +927,36 @@ async def handle_scrape(request: web.Request) -> web.Response:
     wait = str(wait_param).lower() not in ("false", "0", "no")
     limit = min(max(10, int(body.get("limit") or request.query.get("limit") or 200)), 1000)
     post_index = max(1, int(body.get("post_index") or request.query.get("post_index") or 1))
+    explicit_posts = int(body.get("posts") or request.query.get("posts") or 0)
+    monitor_param = body.get("monitor", request.query.get("monitor", "false"))
+    monitor = str(monitor_param).lower() in ("true", "1", "yes")
     explicit_platform = (body.get("platform") or request.query.get("platform") or "").strip().lower()
 
     resolved_post_meta: Optional[Dict[str, Any]] = None
+    profile_meta: Optional[Dict[str, Any]] = None
+    profile_recent_preview: Optional[List[Dict[str, Any]]] = None
     ig_username = _extract_instagram_profile_username(raw_url) if explicit_platform != "telegram" else None
+
+    if ig_username and explicit_posts > 1:
+        mtproto = request.app.get("mtproto")
+        payload, status_code = await _execute_profile_analysis(
+            ig_username=ig_username,
+            posts_count=explicit_posts,
+            per_post_limit=min(limit, 120),
+            scrape_comments=True,
+            monitor=monitor,
+            mtproto=mtproto,
+        )
+        if not payload:
+            return web.json_response({"error": f"Could not fetch profile '@{ig_username}'."}, status=status_code)
+        return web.json_response(payload)
 
     if ig_username:
         async with async_session_factory() as session:
             pool_mgr = SessionPoolManager(session)
             ig_collector = InstagramCollector(pool_mgr)
-            posts = await ig_collector.fetch_profile_recent_posts(
+            profile_meta, posts = await _fetch_ig_profile_and_posts(
+                ig_collector,
                 ig_username,
                 count=max(5, post_index),
             )
@@ -632,6 +993,18 @@ async def handle_scrape(request: web.Request) -> web.Response:
                 "comment_count": selected.get("comment_count", 0),
                 "like_count": selected.get("like_count", 0),
             }
+            profile_recent_preview = [
+                {
+                    "post_index": p["post_index"],
+                    "shortcode": p["shortcode"],
+                    "url": p["url"],
+                    "comment_count": p.get("comment_count", 0),
+                    "like_count": p.get("like_count", 0),
+                    "published_at": p.get("published_at"),
+                    "caption": _truncate(p.get("caption"), 70),
+                }
+                for p in posts[:5]
+            ]
     else:
         platform, target_type, external_id, clean_url = detect_platform_and_id(raw_url)
         if not platform or not external_id:
@@ -649,6 +1022,7 @@ async def handle_scrape(request: web.Request) -> web.Response:
             external_id=external_id,
             url=clean_url,
             title_or_name=target_title,
+            is_active=monitor or (platform == "telegram"),
         )
         await session.commit()
         target_id = target.id
@@ -684,8 +1058,12 @@ async def handle_scrape(request: web.Request) -> web.Response:
         t_repo = TargetRepository(session)
         updated_target = await t_repo.get_by_id(target_id)
         payload = await _build_target_check_payload(session, updated_target, flagged_limit=10, sample_limit=6)
+        if profile_meta:
+            payload["profile"] = profile_meta
         if resolved_post_meta:
             payload["resolved_post"] = resolved_post_meta
+        if profile_recent_preview:
+            payload["profile_recent_posts"] = profile_recent_preview
         payload["scrape_result"] = {
             "status": "completed",
             "newly_ingested": newly_inserted,
@@ -817,8 +1195,19 @@ def create_bridge_app(mtproto: Optional[Any] = None) -> web.Application:
     app.router.add_get("/health", handle_health)
     app.router.add_get("/api/digest", handle_digest)
     app.router.add_get("/api/check", handle_check)
+    app.router.add_get("/api/posts", handle_posts)
+    app.router.add_post("/api/posts", handle_posts)
+    app.router.add_get("/api/profile", handle_profile)
+    app.router.add_post("/api/profile", handle_profile)
+    app.router.add_get("/api/profiles", handle_profile)
+    app.router.add_post("/api/profiles", handle_profile)
+    app.router.add_get("/api/scrape/profile", handle_profile)
+    app.router.add_post("/api/scrape/profile", handle_profile)
     app.router.add_post("/api/scrape", handle_scrape)
     app.router.add_get("/api/scrape", handle_scrape)
+    app.router.add_delete("/api/target", handle_delete_target)
+    app.router.add_post("/api/target/delete", handle_delete_target)
+    app.router.add_get("/api/target/delete", handle_delete_target)
     app.router.add_get("/api/search", handle_search)
     app.router.add_get("/api/sessions", handle_sessions)
     return app

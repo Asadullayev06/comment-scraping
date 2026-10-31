@@ -138,11 +138,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="For Instagram profiles: 1 = most recent post (default), 2 = 2nd most recent, etc.",
     )
     p_scrape.add_argument(
+        "--posts",
+        type=int,
+        default=0,
+        help="Optional: scrape & aggregate across the last N posts (1-5) of a profile",
+    )
+    p_scrape.add_argument(
+        "--monitor",
+        action="store_true",
+        help="Keep target active in 5-minute background cron schedule (default: false for one-off scrapes)",
+    )
+    p_scrape.add_argument(
         "--no-wait",
         action="store_true",
         help="Enqueue background job and return immediately instead of waiting for LLM evaluation",
     )
     p_scrape.add_argument("--limit", type=int, default=200, help="Max comments to scrape (default: 200)")
+
+    # 3b. ops profile
+    p_profile = sub.add_parser(
+        "profile",
+        help="Analyze an Instagram profile across its last N posts (bio, followers, cadence, comments, threats).",
+    )
+    p_profile.add_argument("handle", type=str, help="Instagram @handle or profile URL")
+    p_profile.add_argument("--posts", type=int, default=3, help="Number of recent posts to analyze (default: 3, max: 5)")
+    p_profile.add_argument("--limit", type=int, default=80, help="Max comments per post (default: 80)")
+    p_profile.add_argument("--no-scrape", action="store_true", help="Only fetch profile & post metadata without scraping comments")
+
+    # 3c. ops posts
+    p_posts = sub.add_parser(
+        "posts",
+        help="List an Instagram profile's recent posts with comment/like counts and shortcodes.",
+    )
+    p_posts.add_argument("handle", type=str, help="Instagram @handle or profile URL")
+    p_posts.add_argument("--count", type=int, default=5, help="Number of recent posts to list (default: 5, max: 10)")
+
+    # 3d. ops untarget
+    p_untarget = sub.add_parser(
+        "untarget",
+        help="Deactivate or delete a monitored target by ID, shortcode, or handle.",
+    )
+    p_untarget.add_argument("target", type=str, help="Target shortcode, UUID, or @handle")
+    p_untarget.add_argument("--delete", action="store_true", help="Permanently delete target instead of deactivating")
 
     # 4. ops search
     p_search = sub.add_parser(
@@ -198,10 +235,35 @@ def main():
             body={
                 "url": args.url,
                 "post_index": args.post_index,
+                "posts": args.posts if args.posts > 0 else None,
+                "monitor": args.monitor,
                 "wait": not args.no_wait,
                 "limit": args.limit,
             },
-            timeout=180,
+            timeout=240,
+        )
+    elif args.command == "profile":
+        res = api_request(
+            "/api/profile",
+            method="POST",
+            body={
+                "handle": args.handle,
+                "posts": args.posts,
+                "limit": args.limit,
+                "scrape": not args.no_scrape,
+            },
+            timeout=240,
+        )
+    elif args.command == "posts":
+        res = api_request(
+            "/api/posts",
+            params={"target": args.handle, "count": args.count},
+        )
+    elif args.command == "untarget":
+        res = api_request(
+            "/api/target/delete",
+            method="POST",
+            body={"target": args.target, "delete": args.delete},
         )
     elif args.command == "search":
         res = api_request(

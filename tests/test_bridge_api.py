@@ -248,9 +248,32 @@ async def test_bridge_instagram_profile_check_and_scrape(bridge_client, monkeypa
     assert scrape_data["scrape_result"]["newly_ingested"] == 1
     assert scrape_data["stats"]["evaluated"] == 1
 
-    # 3. Test POST /api/scrape with post_index=2 -> SecondPost222
+    # 3. Test POST /api/scrape with post_index=2 -> SecondPost222 (verify one-off scrape is_active=False)
     scrape_resp2 = await bridge_client.post("/api/scrape", json={"url": "instagram.com/kun.uz", "post_index": 2})
     assert scrape_resp2.status == 200
     scrape_data2 = await scrape_resp2.json()
     assert scrape_data2["resolved_post"]["shortcode"] == "SecondPost222"
     assert scrape_data2["resolved_post"]["post_index"] == 2
+    assert scrape_data2["target"]["is_active"] is False
+
+    # 4. Test POST /api/profile (multi-post profile enumeration + comment aggregation)
+    prof_resp = await bridge_client.post("/api/profile", json={"handle": "@kun.uz", "posts": 2})
+    assert prof_resp.status == 200
+    prof_data = await prof_resp.json()
+    assert prof_data["profile"]["username"] == "@kun.uz"
+    assert prof_data["cadence_and_engagement"]["posts_analyzed"] == 2
+    assert len(prof_data["posts"]) == 2
+    assert prof_data["comment_stats"]["total_stored"] == 2
+    assert prof_data["comment_stats"]["evaluated"] == 2
+
+    # 5. Test GET /api/posts?target=@kun.uz
+    posts_resp = await bridge_client.get("/api/posts?target=@kun.uz")
+    assert posts_resp.status == 200
+    posts_data = await posts_resp.json()
+    assert len(posts_data["recent_posts"]) == 2
+
+    # 6. Test POST /api/target/delete
+    del_resp = await bridge_client.post("/api/target/delete", json={"target": "SecondPost222", "delete": True})
+    assert del_resp.status == 200
+    del_data = await del_resp.json()
+    assert del_data["action"] == "deleted"
