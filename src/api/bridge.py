@@ -162,6 +162,35 @@ def _extract_x_profile_username(raw_input: str, explicit_platform: str = "") -> 
     return None
 
 
+def _extract_youtube_profile_username(raw_input: str, explicit_platform: str = "") -> Optional[str]:
+    """Return YouTube channel identifier (@handle, channel/UC..., c/..., user/...) if raw_input is a YouTube channel URL or handle."""
+    text = raw_input.strip()
+    if not text or text.lower() == "list":
+        return None
+
+    lower = text.lower()
+    if "youtu.be/" in lower or "/watch" in lower or "/shorts/" in lower or "/live/" in lower or "/embed/" in lower:
+        return None
+
+    if "youtube.com/" in lower:
+        m = re.search(r"youtube\.com/(@[A-Za-z0-9._-]+|channel/[A-Za-z0-9_-]+|c/[A-Za-z0-9._-]+|user/[A-Za-z0-9._-]+)", text)
+        if m:
+            return m.group(1)
+        # Also support youtube.com/<channel_slug> if not a reserved path
+        m2 = re.search(r"youtube\.com/([A-Za-z0-9._-]+)(?:[/?#]|$)", text)
+        if m2 and m2.group(1).lower() not in ("watch", "shorts", "live", "feed", "results", "playlist", "gaming", "music", "channel", "c", "user"):
+            return f"@{m2.group(1)}"
+        return None
+
+    if explicit_platform in ("youtube", "yt"):
+        candidate = text.strip()
+        if candidate.startswith("UC") and len(candidate) >= 20:
+            return f"channel/{candidate}"
+        return f"@{candidate.lstrip('@')}"
+
+    return None
+
+
 async def _resolve_target(session: AsyncSession, raw_target: str) -> Optional[MonitoredTarget]:
     """Resolve a MonitoredTarget by UUID, external_id, @handle, or full URL."""
     clean = raw_target.strip()
@@ -474,7 +503,7 @@ async def handle_health_detailed(request: web.Request) -> web.Response:
                 "telegram": mt_connected,
                 "instagram": bool(ig_healthy),
                 "x": bool(x_healthy or settings.X_BEARER_TOKEN),
-                "youtube": bool(settings.YOUTUBE_API_KEY),
+                "youtube": True,
                 "facebook": bool(fb_healthy),
             },
             "credentials": {
@@ -615,6 +644,37 @@ async def _fetch_x_profile_and_posts(
     return meta, posts
 
 
+async def _fetch_youtube_profile_and_posts(
+    yt_collector: YouTubeCollector,
+    username: str,
+    count: int = 5,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Fetch YouTube channel metadata and recent videos, supporting both full and monkeypatched collectors."""
+    try:
+        if getattr(YouTubeCollector.fetch_profile_recent_posts, "__name__", "") != "fetch_profile_recent_posts":
+            posts = await yt_collector.fetch_profile_recent_posts(username, count=count)
+            meta = {
+                "platform": "youtube",
+                "username": username,
+                "url": f"https://www.youtube.com/{username if username.startswith('@') else '@' + username}",
+                "full_name": username.lstrip("@"),
+                "bio": None,
+                "followers": None,
+                "following": None,
+                "total_posts": len(posts),
+                "is_verified": False,
+            }
+            return meta, posts
+
+        meta, posts = await yt_collector.fetch_profile_info_and_posts(username, count=count)
+        if not posts:
+            posts = await yt_collector.fetch_profile_recent_posts(username, count=count)
+        meta["posts_returned"] = len(posts)
+        return meta, posts
+    finally:
+        await yt_collector.stop()
+
+
 async def _execute_profile_analysis(
     ig_username: str,
     posts_count: int = 3,
@@ -624,7 +684,7 @@ async def _execute_profile_analysis(
     mtproto: Optional[Any] = None,
     platform: str = "instagram",
 ) -> Tuple[Optional[Dict[str, Any]], int]:
-    """Enumerate an Instagram or X profile's last N posts, scrape & score comments/replies on each, and aggregate."""
+    """Enumerate an Instagram, X, or YouTube profile's last N posts, scrape & score comments/replies on each, and aggregate."""
     posts_count = min(max(1, posts_count), 5)  # Hard cap at 5 posts to protect burner session
 
     async with async_session_factory() as session:
@@ -637,6 +697,13 @@ async def _execute_profile_analysis(
             x_collector = TwitterXCollector(pool_mgr)
             profile_meta, recent_posts = await _fetch_x_profile_and_posts(
                 x_collector,
+                ig_username,
+                count=max(5, posts_count),
+            )
+        elif platform == "youtube":
+            yt_collector = YouTubeCollector()
+            profile_meta, recent_posts = await _fetch_youtube_profile_and_posts(
+                yt_collector,
                 ig_username,
                 count=max(5, posts_count),
             )
@@ -861,7 +928,7 @@ async def _execute_profile_analysis(
 
 
 async def handle_posts(request: web.Request) -> web.Response:
-    """GET /api/posts?target=@handle&count=5 — List recent posts of an Instagram or X profile without scraping comments."""
+    """GET /api/posts?target=@handle&count=5 — List recent posts of an Instagram, X, or YouTube profile without scraping comments."""
     target_input = (
         request.query.get("target")
         or request.query.get("handle")
@@ -872,19 +939,29 @@ async def handle_posts(request: web.Request) -> web.Response:
     explicit_platform = (request.query.get("platform") or "").strip().lower()
     count = min(max(1, int(request.query.get("count") or request.query.get("limit") or 5)), 10)
 
-    x_username = _extract_x_profile_username(target_input, explicit_platform=explicit_platform)
-    ig_username = None if x_username else _extract_instagram_profile_username(target_input)
+    yt_username = _extract_youtube_profile_username(target_input, explicit_platform=explicit_platform)
+    x_username = None if yt_username else _extract_x_profile_username(target_input, explicit_platform=explicit_platform)
+    ig_username = None if (yt_username or x_username) else _extract_instagram_profile_username(target_input)
 
-    if not x_username and not ig_username:
+    if not yt_username and not x_username and not ig_username:
         return web.json_response(
-            {"error": f"Provide a valid Instagram or X handle/profile URL (got '{target_input}')."},
+            {"error": f"Provide a valid Instagram, X, or YouTube handle/profile URL (got '{target_input}')."},
             status=400,
         )
 
     try:
         async with async_session_factory() as session:
             pool_mgr = SessionPoolManager(session)
-            if x_username:
+            if yt_username:
+                yt_collector = YouTubeCollector()
+                profile_meta, recent_posts = await _fetch_youtube_profile_and_posts(yt_collector, yt_username, count=count)
+                if not recent_posts:
+                    return web.json_response(
+                        {"error": f"Could not fetch videos for YouTube channel '{yt_username}'."},
+                        status=404,
+                    )
+                return web.json_response({"profile": profile_meta, "recent_posts": recent_posts})
+            elif x_username:
                 x_collector = TwitterXCollector(pool_mgr)
                 profile_meta, recent_posts = await _fetch_x_profile_and_posts(x_collector, x_username, count=count)
                 if not recent_posts:
@@ -930,14 +1007,15 @@ async def handle_profile(request: web.Request) -> web.Response:
         return web.json_response({"error": "Missing required 'handle' or 'target' parameter."}, status=400)
 
     explicit_platform = (body.get("platform") or request.query.get("platform") or "").strip().lower()
-    x_username = _extract_x_profile_username(raw_handle, explicit_platform=explicit_platform)
-    ig_username = None if x_username else _extract_instagram_profile_username(raw_handle)
-    prof_username = x_username or ig_username
-    prof_platform = "x" if x_username else "instagram"
+    yt_username = _extract_youtube_profile_username(raw_handle, explicit_platform=explicit_platform)
+    x_username = None if yt_username else _extract_x_profile_username(raw_handle, explicit_platform=explicit_platform)
+    ig_username = None if (yt_username or x_username) else _extract_instagram_profile_username(raw_handle)
+    prof_username = yt_username or x_username or ig_username
+    prof_platform = "youtube" if yt_username else ("x" if x_username else "instagram")
 
     if not prof_username:
         return web.json_response(
-            {"error": f"Could not parse Instagram or X handle from '{raw_handle}'."},
+            {"error": f"Could not parse Instagram, X, or YouTube handle from '{raw_handle}'."},
             status=400,
         )
 
@@ -966,7 +1044,7 @@ async def handle_profile(request: web.Request) -> web.Response:
         )
     if not payload:
         return web.json_response(
-            {"error": f"Could not fetch profile or posts for '@{prof_username}' on {prof_platform}."},
+            {"error": f"Could not fetch profile or posts for '{prof_username}' on {prof_platform}."},
             status=status_code,
         )
     return web.json_response(payload)
@@ -1032,15 +1110,22 @@ async def handle_check(request: web.Request) -> web.Response:
                 }
             )
 
-        # Check if target_input is an X or Instagram profile URL or @username handle
-        x_username = _extract_x_profile_username(target_input, explicit_platform=explicit_platform)
-        ig_username = None if x_username else _extract_instagram_profile_username(target_input)
+        # Check if target_input is a YouTube, X, or Instagram profile URL or @username handle
+        yt_username = _extract_youtube_profile_username(target_input, explicit_platform=explicit_platform)
+        x_username = None if yt_username else _extract_x_profile_username(target_input, explicit_platform=explicit_platform)
+        ig_username = None if (yt_username or x_username) else _extract_instagram_profile_username(target_input)
         is_explicit_ig_profile = "instagram.com" in target_input.lower() and ig_username is not None
         is_explicit_x_profile = ("x.com" in target_input.lower() or "twitter.com" in target_input.lower()) and x_username is not None
+        is_explicit_yt_profile = "youtube.com" in target_input.lower() and yt_username is not None
 
         # Resolve existing monitored target first unless explicitly querying a profile URL/@handle
         target = None
-        if not is_explicit_ig_profile and not is_explicit_x_profile and explicit_platform not in ("instagram", "x", "twitter"):
+        if (
+            not is_explicit_ig_profile
+            and not is_explicit_x_profile
+            and not is_explicit_yt_profile
+            and explicit_platform not in ("instagram", "x", "twitter", "youtube", "yt")
+        ):
             if target_input.startswith("@"):
                 # Only match if an active Telegram target with this exact @handle has collected comments
                 stmt_tg = select(MonitoredTarget).where(
@@ -1055,7 +1140,17 @@ async def handle_check(request: web.Request) -> web.Response:
             else:
                 target = await _resolve_target(session, target_input)
 
-        # If no existing post/chat target matched and x_username or ig_username is present, list the profile's last 5 posts
+        # If no existing post/chat target matched and yt/x/ig username is present, list the profile's last 5 posts
+        if not target and yt_username:
+            yt_collector = YouTubeCollector()
+            try:
+                profile_meta, recent_posts = await _fetch_youtube_profile_and_posts(yt_collector, yt_username, count=5)
+                if recent_posts:
+                    return web.json_response({"profile": profile_meta, "recent_posts": recent_posts})
+            except ScraperError as s_err:
+                return web.json_response({"error": s_err.error_code, "message": s_err.message, "platform": "youtube"}, status=s_err.status_code)
+            target = await _resolve_target(session, target_input)
+
         if not target and x_username:
             pool_mgr = SessionPoolManager(session)
             x_collector = TwitterXCollector(pool_mgr)
@@ -1136,10 +1231,11 @@ async def handle_scrape(request: web.Request) -> web.Response:
     resolved_post_meta: Optional[Dict[str, Any]] = None
     profile_meta: Optional[Dict[str, Any]] = None
     profile_recent_preview: Optional[List[Dict[str, Any]]] = None
-    x_username = _extract_x_profile_username(raw_url, explicit_platform=explicit_platform)
-    ig_username = None if x_username else (_extract_instagram_profile_username(raw_url) if explicit_platform != "telegram" else None)
-    prof_username = x_username or ig_username
-    prof_platform = "x" if x_username else "instagram"
+    yt_username = _extract_youtube_profile_username(raw_url, explicit_platform=explicit_platform)
+    x_username = None if yt_username else _extract_x_profile_username(raw_url, explicit_platform=explicit_platform)
+    ig_username = None if (yt_username or x_username) else (_extract_instagram_profile_username(raw_url) if explicit_platform != "telegram" else None)
+    prof_username = yt_username or x_username or ig_username
+    prof_platform = "youtube" if yt_username else ("x" if x_username else "instagram")
 
     if prof_username and explicit_posts > 1:
         mtproto = request.app.get("mtproto")
@@ -1159,10 +1255,67 @@ async def handle_scrape(request: web.Request) -> web.Response:
                 status=s_err.status_code,
             )
         if not payload:
-            return web.json_response({"error": f"Could not fetch profile '@{prof_username}' on {prof_platform}."}, status=status_code)
+            return web.json_response({"error": f"Could not fetch profile '{prof_username}' on {prof_platform}."}, status=status_code)
         return web.json_response(payload)
 
-    if x_username:
+    if yt_username:
+        yt_collector = YouTubeCollector()
+        try:
+            profile_meta, posts = await _fetch_youtube_profile_and_posts(
+                yt_collector,
+                yt_username,
+                count=max(5, post_index),
+            )
+        except ScraperError as s_err:
+            return web.json_response(
+                {"error": s_err.error_code, "message": s_err.message, "platform": "youtube"},
+                status=s_err.status_code,
+            )
+        if not posts:
+            return web.json_response(
+                {
+                    "error": f"Could not resolve recent videos for YouTube channel '{yt_username}'.",
+                },
+                status=404,
+            )
+        if post_index > len(posts):
+            return web.json_response(
+                {
+                    "error": f"Requested post_index={post_index}, but YouTube channel '{yt_username}' only returned {len(posts)} videos.",
+                    "recent_posts": posts,
+                },
+                status=400,
+            )
+
+        selected = posts[post_index - 1]
+        platform = "youtube"
+        target_type = "post_url"
+        external_id = selected["shortcode"]
+        clean_url = selected["url"]
+        target_title = f"YouTube {yt_username} ({external_id})"
+        resolved_post_meta = {
+            "username": yt_username,
+            "post_index": post_index,
+            "shortcode": selected["shortcode"],
+            "url": selected["url"],
+            "caption": selected.get("caption"),
+            "published_at": selected.get("published_at"),
+            "comment_count": selected.get("comment_count", 0),
+            "like_count": selected.get("like_count", 0),
+        }
+        profile_recent_preview = [
+            {
+                "post_index": p["post_index"],
+                "shortcode": p["shortcode"],
+                "url": p["url"],
+                "comment_count": p.get("comment_count", 0),
+                "like_count": p.get("like_count", 0),
+                "published_at": p.get("published_at"),
+                "caption": _truncate(p.get("caption"), 70),
+            }
+            for p in posts[:5]
+        ]
+    elif x_username:
         async with async_session_factory() as session:
             s_repo = SessionRepository(session)
             x_sess = await s_repo.get_healthy_session("x")
@@ -1333,16 +1486,6 @@ async def handle_scrape(request: web.Request) -> web.Response:
                         "error": "no facebook session configured",
                         "platform": "facebook",
                         "hint": "Add a Facebook burner session via 'ops sessions --add facebook <account> <cookies_json>'.",
-                    },
-                    status=409,
-                )
-        elif platform == "youtube":
-            if not settings.YOUTUBE_API_KEY:
-                return web.json_response(
-                    {
-                        "error": "no youtube api key configured",
-                        "platform": "youtube",
-                        "hint": "Set YOUTUBE_API_KEY in Coolify environment variables.",
                     },
                     status=409,
                 )

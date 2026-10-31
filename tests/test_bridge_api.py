@@ -698,4 +698,98 @@ async def test_bridge_x_scrape_replies_and_explicit_errors(bridge_client, monkey
     assert x_prof_data["comment_stats"]["total_stored"] == 2
     assert x_prof_data["comment_stats"]["flagged_count"] == 1
 
+    # 7. Test YouTube video comment scraping & YouTube channel profile analysis (keyless InnerTube)
+    from src.collectors.youtube import YouTubeCollector
+    from src.schemas.comment import NormalizedComment
+    from datetime import datetime, timezone
+
+    async def mock_yt_fetch_comments(self, target, cursor=None, limit=1000):
+        self.last_focal_tweet_meta = {
+            "id": target.external_id,
+            "author": "KunUZ",
+            "text": "Sample YouTube video title",
+            "view_count": 50000,
+        }
+        yield NormalizedComment(
+            platform="youtube",
+            external_comment_id=f"yt_c1_{target.external_id}",
+            parent_external_id=target.external_id,
+            target_external_id=target.external_id,
+            source_name="YouTube KunUZ",
+            post_url=f"https://www.youtube.com/watch?v={target.external_id}",
+            comment_url=f"https://www.youtube.com/watch?v={target.external_id}&lc=c1",
+            author_external_id="UC_user_1",
+            author_username="yt_critic",
+            author_display_name="@yt_critic",
+            content_text="This whole project is a corrupt scam stealing public budget!",
+            published_at=datetime.now(timezone.utc),
+            child_comment_count=3,
+        )
+
+    async def mock_yt_profile_info(self, username, count=5):
+        return (
+            {
+                "platform": "youtube",
+                "channel_id": "UC12345678901234567890",
+                "username": "@KunUZ",
+                "url": "https://www.youtube.com/@KunUZ",
+                "full_name": "Kun.uz Official",
+                "bio": "Official YouTube channel",
+                "followers": 2400000,
+                "following": None,
+                "total_posts": 18000,
+                "is_verified": True,
+            },
+            [
+                {
+                    "post_index": 1,
+                    "shortcode": "Yil32mThG04",
+                    "video_id": "Yil32mThG04",
+                    "url": "https://www.youtube.com/watch?v=Yil32mThG04",
+                    "caption": "Latest YouTube Video 1",
+                    "comment_count": 15,
+                    "like_count": 12000,
+                    "view_count": 12000,
+                    "published_at": "1 day ago",
+                },
+                {
+                    "post_index": 2,
+                    "shortcode": "QEM3EHUV5ko",
+                    "video_id": "QEM3EHUV5ko",
+                    "url": "https://www.youtube.com/watch?v=QEM3EHUV5ko",
+                    "caption": "Second YouTube Video 2",
+                    "comment_count": 8,
+                    "like_count": 9000,
+                    "view_count": 9000,
+                    "published_at": "2 days ago",
+                },
+            ][:count],
+        )
+
+    monkeypatch.setattr(YouTubeCollector, "fetch_comments", mock_yt_fetch_comments)
+    monkeypatch.setattr(YouTubeCollector, "fetch_profile_info_and_posts", mock_yt_profile_info)
+
+    yt_scrape_resp = await bridge_client.post(
+        "/api/scrape",
+        json={"url": "https://www.youtube.com/watch?v=Yil32mThG04"},
+    )
+    assert yt_scrape_resp.status == 200
+    yt_scrape_data = await yt_scrape_resp.json()
+    assert yt_scrape_data["target"]["platform"] == "youtube"
+    assert yt_scrape_data["stats"]["total_comments"] == 1
+    assert yt_scrape_data["stats"]["flagged_count"] == 1
+
+    yt_prof_resp = await bridge_client.post(
+        "/api/profile",
+        json={"handle": "https://www.youtube.com/@KunUZ", "posts": 2},
+    )
+    assert yt_prof_resp.status == 200
+    yt_prof_data = await yt_prof_resp.json()
+    assert yt_prof_data["profile"]["platform"] == "youtube"
+    assert yt_prof_data["profile"]["followers"] == 2400000
+    assert yt_prof_data["cadence_and_engagement"]["posts_analyzed"] == 2
+    assert yt_prof_data["comment_stats"]["total_stored"] == 2
+    assert yt_prof_data["comment_stats"]["flagged_count"] == 2
+
+
 

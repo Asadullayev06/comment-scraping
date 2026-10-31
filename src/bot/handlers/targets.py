@@ -45,7 +45,9 @@ def detect_platform_and_id(input_str: str) -> Tuple[Optional[str], Optional[str]
     if "youtube.com" in text or "youtu.be" in text:
         platform = "youtube"
         target_type = "post_url"
-        match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", text)
+        match = re.search(r"(?:[?&]v=|youtu\.be/|/shorts/|/live/|/embed/)([0-9A-Za-z_-]{11})(?:[?&/#]|$)", text)
+        if not match:
+            match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})(?:[?&/#]|$)", text)
         video_id = match.group(1) if match else text
         return platform, target_type, video_id, text
 
