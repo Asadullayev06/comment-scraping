@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     # YouTube Official API (Optional)
     YOUTUBE_API_KEY: Optional[str] = Field(default=None)
 
+    # X (Twitter) Official API v2 Bearer Token (Optional alternative to burner cookies)
+    X_BEARER_TOKEN: Optional[str] = Field(default=None)
+
     # Database & Redis
     DATABASE_URL: str = Field(
         default="postgresql+asyncpg://operatives:strongpassword@postgres:5432/operatives_db"

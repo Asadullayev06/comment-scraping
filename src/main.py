@@ -59,9 +59,15 @@ async def init_models():
                     "WHERE LOWER(content_text) LIKE '%kimga pul kere%'"
                 )
             )
-            # Deactivate one-off test target DfJp_LaFGCn so it doesn't stay in the background cron schedule
+            # Deactivate one-off test target DfJp_LaFGCn and remove empty X test target 2113589268937421273
             await conn.execute(
                 text("UPDATE monitored_targets SET is_active = FALSE WHERE external_id = 'DfJp_LaFGCn'")
+            )
+            await conn.execute(
+                text(
+                    "DELETE FROM monitored_targets WHERE external_id = '2113589268937421273' "
+                    "AND total_comments_collected = 0"
+                )
             )
         except Exception as clean_err:
             logger.debug("Optional startup SQL cleanup skipped", error=str(clean_err))

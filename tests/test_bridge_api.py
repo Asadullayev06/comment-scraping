@@ -277,3 +277,39 @@ async def test_bridge_instagram_profile_check_and_scrape(bridge_client, monkeypa
     assert del_resp.status == 200
     del_data = await del_resp.json()
     assert del_data["action"] == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_bridge_x_409_and_detailed_health(bridge_client):
+    """Verify /health/detailed works and scraping X without a session returns 409 instead of a silent no-op."""
+    # 1. Test /health/detailed
+    h_resp = await bridge_client.get("/health/detailed")
+    assert h_resp.status == 200
+    h_data = await h_resp.json()
+    assert h_data["status"] == "ok"
+    assert h_data["platforms_ready"]["instagram"] is True
+    assert h_data["platforms_ready"]["x"] is False
+
+    # 2. Test scraping X when no X session or X_BEARER_TOKEN is configured -> must fail loudly with 409
+    x_resp = await bridge_client.post(
+        "/api/scrape",
+        json={"url": "https://x.com/ozodlik/status/2113589268937421273"},
+    )
+    assert x_resp.status == 409
+    x_data = await x_resp.json()
+    assert x_data["error"] == "no x session configured"
+    assert x_data["platform"] == "x"
+
+    # 3. Add an X session via POST /api/sessions and verify /health/detailed updates
+    add_resp = await bridge_client.post(
+        "/api/sessions",
+        json={
+            "platform": "x",
+            "account": "x_burner_1",
+            "cookies": {"auth_token": "tok123", "ct0": "csrf456"},
+        },
+    )
+    assert add_resp.status == 200
+    add_data = await add_resp.json()
+    assert add_data["added_session"] == "x_burner_1"
+    assert add_data["total_burner_sessions"] == 2

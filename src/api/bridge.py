@@ -403,6 +403,61 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "mtproto_connected": mt_connected})
 
 
+async def handle_health_detailed(request: web.Request) -> web.Response:
+    """GET /health/detailed — Detailed health, DB stats, and platform session readiness."""
+    mtproto = request.app.get("mtproto")
+    mt_connected = bool(mtproto and mtproto.client and mtproto.client.is_connected())
+
+    async with async_session_factory() as session:
+        total_targets = (await session.execute(select(func.count(MonitoredTarget.id)))).scalar() or 0
+        active_targets = (
+            await session.execute(select(func.count(MonitoredTarget.id)).where(MonitoredTarget.is_active.is_(True)))
+        ).scalar() or 0
+        total_comments = (await session.execute(select(func.count(Comment.id)))).scalar() or 0
+        evaluated_comments = (
+            await session.execute(select(func.count(Comment.id)).where(Comment.llm_status == "evaluated"))
+        ).scalar() or 0
+        flagged_comments = (
+            await session.execute(
+                select(func.count(Comment.id)).where(
+                    Comment.severity_score >= settings.LLM_ALERT_SEVERITY_THRESHOLD
+                )
+            )
+        ).scalar() or 0
+
+        s_repo = SessionRepository(session)
+        ig_healthy = await s_repo.get_healthy_session("instagram")
+        x_healthy = await s_repo.get_healthy_session("x")
+        fb_healthy = await s_repo.get_healthy_session("facebook")
+
+    return web.json_response(
+        {
+            "status": "ok",
+            "database": "connected",
+            "mtproto_connected": mt_connected,
+            "counts": {
+                "monitored_targets": total_targets,
+                "active_targets": active_targets,
+                "total_comments": total_comments,
+                "evaluated_comments": evaluated_comments,
+                "flagged_comments": flagged_comments,
+            },
+            "platforms_ready": {
+                "telegram": mt_connected,
+                "instagram": bool(ig_healthy),
+                "x": bool(x_healthy or settings.X_BEARER_TOKEN),
+                "youtube": bool(settings.YOUTUBE_API_KEY),
+                "facebook": bool(fb_healthy),
+            },
+            "credentials": {
+                "deepseek_api_key": bool(settings.DEEPSEEK_API_KEY),
+                "youtube_api_key": bool(settings.YOUTUBE_API_KEY),
+                "x_bearer_token": bool(settings.X_BEARER_TOKEN),
+            },
+        }
+    )
+
+
 async def handle_digest(request: web.Request) -> web.Response:
     """GET /api/digest?hours=24&platform=&min_score=7&limit=12"""
     hours = max(1, int(request.query.get("hours", 24)))
@@ -1014,7 +1069,57 @@ async def handle_scrape(request: web.Request) -> web.Response:
             )
         target_title = f"{platform.capitalize()} Target: {external_id}"
 
+    # Pre-flight check: fail loudly with 409 if no session or API credential is configured for the platform
     async with async_session_factory() as session:
+        s_repo = SessionRepository(session)
+        if platform == "x":
+            x_session = await s_repo.get_healthy_session("x")
+            if not x_session and not settings.X_BEARER_TOKEN:
+                return web.json_response(
+                    {
+                        "error": "no x session configured",
+                        "platform": "x",
+                        "hint": (
+                            "Add an X burner session via 'ops sessions --add x <account> "
+                            "\"{\\\"auth_token\\\":\\\"...\\\",\\\"ct0\\\":\\\"...\\\"}\"' "
+                            "or set X_BEARER_TOKEN in Coolify environment variables."
+                        ),
+                    },
+                    status=409,
+                )
+        elif platform == "instagram":
+            ig_session = await s_repo.get_healthy_session("instagram")
+            if not ig_session:
+                return web.json_response(
+                    {
+                        "error": "no instagram session configured",
+                        "platform": "instagram",
+                        "hint": "Add an Instagram burner session via 'ops sessions --add instagram <account> <sessionid>'.",
+                    },
+                    status=409,
+                )
+        elif platform == "facebook":
+            fb_session = await s_repo.get_healthy_session("facebook")
+            if not fb_session:
+                return web.json_response(
+                    {
+                        "error": "no facebook session configured",
+                        "platform": "facebook",
+                        "hint": "Add a Facebook burner session via 'ops sessions --add facebook <account> <cookies_json>'.",
+                    },
+                    status=409,
+                )
+        elif platform == "youtube":
+            if not settings.YOUTUBE_API_KEY:
+                return web.json_response(
+                    {
+                        "error": "no youtube api key configured",
+                        "platform": "youtube",
+                        "hint": "Set YOUTUBE_API_KEY in Coolify environment variables.",
+                    },
+                    status=409,
+                )
+
         t_repo = TargetRepository(session)
         target = await t_repo.create_or_activate(
             platform=platform,
@@ -1026,6 +1131,7 @@ async def handle_scrape(request: web.Request) -> web.Response:
         )
         await session.commit()
         target_id = target.id
+        is_target_active = target.is_active
 
     mtproto = request.app.get("mtproto")
 
@@ -1046,7 +1152,10 @@ async def handle_scrape(request: web.Request) -> web.Response:
             "platform": platform,
             "external_id": external_id,
             "url": clean_url,
+            "is_active": is_target_active,
         }
+        if not is_target_active:
+            resp_payload["warning"] = "Target registered with is_active=false (one-off scrape; pass --monitor to schedule recurring polling)."
         if resolved_post_meta:
             resp_payload["resolved_post"] = resolved_post_meta
         return web.json_response(resp_payload)
@@ -1064,11 +1173,15 @@ async def handle_scrape(request: web.Request) -> web.Response:
             payload["resolved_post"] = resolved_post_meta
         if profile_recent_preview:
             payload["profile_recent_posts"] = profile_recent_preview
-        payload["scrape_result"] = {
+        scrape_res: Dict[str, Any] = {
             "status": "completed",
             "newly_ingested": newly_inserted,
             "evaluated_in_run": evaluated,
+            "is_active": updated_target.is_active,
         }
+        if not updated_target.is_active:
+            scrape_res["warning"] = "Target registered with is_active=false (one-off scrape; pass --monitor to schedule recurring polling)."
+        payload["scrape_result"] = scrape_res
         return web.json_response(payload)
 
 
@@ -1134,12 +1247,56 @@ async def handle_search(request: web.Request) -> web.Response:
 
 
 async def handle_sessions(request: web.Request) -> web.Response:
-    """GET /api/sessions?platform=&reset=false"""
-    platform = request.query.get("platform", "").strip().lower() or None
-    reset_flag = request.query.get("reset", "false").lower() in ("true", "1", "yes")
+    """GET/POST /api/sessions — List, reset cooldowns, or add a burner session."""
+    body = {}
+    if request.can_read_body:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+    platform = (body.get("platform") or request.query.get("platform") or "").strip().lower() or None
+    reset_flag = str(body.get("reset") or request.query.get("reset") or "false").lower() in ("true", "1", "yes")
+    add_account = (body.get("account") or request.query.get("account") or "").strip()
+    raw_cookies = body.get("cookies") or request.query.get("cookies")
+    proxy_url = (body.get("proxy_url") or request.query.get("proxy_url") or "").strip() or None
 
     async with async_session_factory() as session:
         s_repo = SessionRepository(session)
+        added_session = None
+        if add_account and raw_cookies and platform:
+            import json as _json
+            cookies_dict: Dict[str, Any] = {}
+            if isinstance(raw_cookies, dict):
+                cookies_dict = raw_cookies
+            elif isinstance(raw_cookies, str):
+                raw_c = raw_cookies.strip()
+                if raw_c.startswith("{"):
+                    try:
+                        cookies_dict = _json.loads(raw_c)
+                    except Exception:
+                        cookies_dict = {"sessionid": raw_c}
+                elif "=" in raw_c and ";" in raw_c:
+                    for part in raw_c.split(";"):
+                        if "=" in part:
+                            k, v = part.split("=", 1)
+                            cookies_dict[k.strip()] = v.strip()
+                elif platform == "instagram":
+                    cookies_dict = {"sessionid": raw_c}
+                elif platform == "x":
+                    cookies_dict = {"auth_token": raw_c}
+                else:
+                    cookies_dict = {"token": raw_c}
+
+            created_s = await s_repo.add_session(
+                platform=platform,
+                account_identifier=add_account,
+                cookies=cookies_dict,
+                proxy_url=proxy_url,
+            )
+            await session.commit()
+            added_session = created_s.account_identifier
+
         reset_count = 0
         if reset_flag:
             reset_count = await s_repo.reset_all_cooldowns(platform=platform)
@@ -1177,15 +1334,18 @@ async def handle_sessions(request: web.Request) -> web.Response:
     mtproto = request.app.get("mtproto")
     mt_connected = bool(mtproto and mtproto.client and mtproto.client.is_connected())
 
-    return web.json_response(
-        {
-            "telegram_mtproto_userbot": "connected" if mt_connected else "disconnected",
-            "total_burner_sessions": len(session_list),
-            "active_burner_sessions": active_count,
-            "cooldowns_reset": reset_count if reset_flag else 0,
-            "sessions": session_list,
-        }
-    )
+    resp_data: Dict[str, Any] = {
+        "telegram_mtproto_userbot": "connected" if mt_connected else "disconnected",
+        "x_bearer_token_configured": bool(settings.X_BEARER_TOKEN),
+        "youtube_api_key_configured": bool(settings.YOUTUBE_API_KEY),
+        "total_burner_sessions": len(session_list),
+        "active_burner_sessions": active_count,
+        "cooldowns_reset": reset_count if reset_flag else 0,
+        "sessions": session_list,
+    }
+    if added_session:
+        resp_data["added_session"] = added_session
+    return web.json_response(resp_data)
 
 
 def create_bridge_app(mtproto: Optional[Any] = None) -> web.Application:
@@ -1193,6 +1353,9 @@ def create_bridge_app(mtproto: Optional[Any] = None) -> web.Application:
     app = web.Application(middlewares=[auth_middleware])
     app["mtproto"] = mtproto
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/health/detailed", handle_health_detailed)
+    app.router.add_get("/api/health", handle_health)
+    app.router.add_get("/api/health/detailed", handle_health_detailed)
     app.router.add_get("/api/digest", handle_digest)
     app.router.add_get("/api/check", handle_check)
     app.router.add_get("/api/posts", handle_posts)
@@ -1210,6 +1373,7 @@ def create_bridge_app(mtproto: Optional[Any] = None) -> web.Application:
     app.router.add_get("/api/target/delete", handle_delete_target)
     app.router.add_get("/api/search", handle_search)
     app.router.add_get("/api/sessions", handle_sessions)
+    app.router.add_post("/api/sessions", handle_sessions)
     return app
 
 

@@ -201,10 +201,16 @@ def build_parser() -> argparse.ArgumentParser:
     # 5. ops sessions
     p_sessions = sub.add_parser(
         "sessions",
-        help="Check burner account health, active/cooldown status, and optionally reset cooldowns.",
+        help="Check burner account health, reset cooldowns, or add a new burner session.",
     )
-    p_sessions.add_argument("--platform", type=str, default="", help="Optional platform filter")
+    p_sessions.add_argument("--platform", type=str, default="", help="Optional platform filter (instagram, x, facebook)")
     p_sessions.add_argument("--reset", action="store_true", help="Reset all cooldown timers and reactivate accounts")
+    p_sessions.add_argument(
+        "--add",
+        nargs=3,
+        metavar=("PLATFORM", "ACCOUNT", "COOKIES"),
+        help="Add a burner session: --add x my_burner '{\"auth_token\":\"...\",\"ct0\":\"...\"}'",
+    )
 
     return parser
 
@@ -278,13 +284,26 @@ def main():
             },
         )
     elif args.command == "sessions":
-        res = api_request(
-            "/api/sessions",
-            params={
-                "platform": args.platform,
-                "reset": "true" if args.reset else "false",
-            },
-        )
+        if args.add:
+            plat, acct, cooks = args.add
+            res = api_request(
+                "/api/sessions",
+                method="POST",
+                body={
+                    "platform": plat,
+                    "account": acct,
+                    "cookies": cooks,
+                    "reset": args.reset,
+                },
+            )
+        else:
+            res = api_request(
+                "/api/sessions",
+                params={
+                    "platform": args.platform,
+                    "reset": "true" if args.reset else "false",
+                },
+            )
     else:
         parser.print_help()
         sys.exit(1)
