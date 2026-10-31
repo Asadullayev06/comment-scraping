@@ -845,3 +845,305 @@ class TwitterXCollector(BaseCollector):
             return
 
         raise ScraperError("no x session configured", "No active X burner session or X_BEARER_TOKEN configured", status_code=409)
+
+    async def fetch_profile_info_and_posts(
+        self,
+        username: str,
+        count: int = 5,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Fetch an X user's profile metadata and their latest N posts (tweets).
+
+        Returns:
+            Tuple of (profile_meta_dict, list_of_recent_posts)
+        """
+        clean_username = username.strip().lstrip("@").split("/")[0].split("?")[0]
+        profile_meta: Dict[str, Any] = {
+            "platform": "x",
+            "username": f"@{clean_username}",
+            "url": f"https://x.com/{clean_username}",
+            "full_name": clean_username,
+            "bio": None,
+            "followers": None,
+            "following": None,
+            "total_posts": None,
+            "is_verified": False,
+        }
+        posts: List[Dict[str, Any]] = []
+
+        # Engine 1: Burner Session Cookies via twikit or Playwright fallback
+        session_tuple = None
+        if self.pool_manager:
+            session_tuple = await self.pool_manager.acquire_session("x")
+
+        if session_tuple:
+            session_obj, raw_cookies, proxy_url = session_tuple
+            cookies: Dict[str, str] = {}
+            if isinstance(raw_cookies, dict):
+                cookies = {str(k): str(v) for k, v in raw_cookies.items() if v is not None}
+            elif isinstance(raw_cookies, str):
+                for part in raw_cookies.split(";"):
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        cookies[k.strip()] = v.strip()
+                if not cookies and raw_cookies.strip():
+                    cookies["auth_token"] = raw_cookies.strip()
+
+            user_agent = (
+                session_obj.user_agent
+                or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+
+            try:
+                cookies = await self._refresh_ct0_cookie(cookies, user_agent=user_agent, proxy_url=proxy_url)
+                if self.pool_manager and cookies.get("ct0"):
+                    await self.pool_manager.update_session_cookies(session_obj.id, cookies)
+
+                # 1a. Try twikit get_user_by_screen_name + get_tweets("Tweets")
+                try:
+                    _patch_twikit_transaction()
+                    from twikit import Client as TwikitClient
+                    from twikit.errors import Unauthorized, Forbidden, NotFound, TooManyRequests, AccountLocked, AccountSuspended
+
+                    tw_client = TwikitClient(language="en-US", proxy=proxy_url, user_agent=user_agent)
+                    tw_client.set_cookies(cookies)
+
+                    user_obj = await tw_client.get_user_by_screen_name(clean_username)
+                    if user_obj:
+                        profile_meta.update(
+                            {
+                                "username": f"@{user_obj.screen_name or clean_username}",
+                                "url": f"https://x.com/{user_obj.screen_name or clean_username}",
+                                "full_name": user_obj.name or clean_username,
+                                "bio": user_obj.description or None,
+                                "followers": int(getattr(user_obj, "followers_count", 0) or 0),
+                                "following": int(getattr(user_obj, "following_count", 0) or 0),
+                                "total_posts": int(getattr(user_obj, "statuses_count", 0) or 0),
+                                "is_verified": bool(getattr(user_obj, "is_blue_verified", False) or getattr(user_obj, "verified", False)),
+                            }
+                        )
+                        user_tweets = await user_obj.get_tweets("Tweets", count=max(10, count * 2))
+                        for tw in user_tweets or []:
+                            # Skip pure retweets if possible so we analyze the account's own posts
+                            tw_text = getattr(tw, "full_text", None) or getattr(tw, "text", "") or ""
+                            if tw_text.startswith("RT @") and len(posts) >= count:
+                                continue
+                            tw_id = str(getattr(tw, "id", "") or "")
+                            if not tw_id:
+                                continue
+                            pub_dt = _parse_x_created_at(getattr(tw, "created_at", None))
+                            posts.append(
+                                {
+                                    "post_index": len(posts) + 1,
+                                    "shortcode": tw_id,
+                                    "tweet_id": tw_id,
+                                    "url": f"https://x.com/{clean_username}/status/{tw_id}",
+                                    "caption": tw_text[:200],
+                                    "comment_count": int(getattr(tw, "reply_count", 0) or 0),
+                                    "like_count": int(getattr(tw, "favorite_count", 0) or 0),
+                                    "retweet_count": int(getattr(tw, "retweet_count", 0) or 0),
+                                    "published_at": pub_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                                }
+                            )
+                            if len(posts) >= count:
+                                break
+
+                    rotated = tw_client.get_cookies()
+                    if rotated and self.pool_manager:
+                        cookies.update({str(k): str(v) for k, v in rotated.items() if v})
+                        await self.pool_manager.update_session_cookies(session_obj.id, cookies)
+
+                except (Unauthorized, Forbidden, AccountLocked, AccountSuspended) as auth_err:
+                    raise ScraperError("x session rejected", f"X session rejected: {auth_err}", status_code=401)
+                except TooManyRequests as rl_err:
+                    raise ScraperError("rate limited", f"X rate limited: {rl_err}", status_code=429)
+                except NotFound as nf_err:
+                    raise ScraperError("profile not found", f"X user @{clean_username} not found: {nf_err}", status_code=404)
+                except ScraperError:
+                    raise
+                except Exception as tw_prof_err:
+                    logger.warning("twikit profile fetch failed; trying Playwright fallback", username=clean_username, error=str(tw_prof_err))
+
+                # 1b. Playwright fallback for X profile timeline (UserByScreenName + UserTweets)
+                if not posts:
+                    from playwright.async_api import async_playwright
+
+                    user_payloads: List[Dict[str, Any]] = []
+                    tweets_payloads: List[Dict[str, Any]] = []
+                    pw_cookies = []
+                    for name, val in cookies.items():
+                        if not val:
+                            continue
+                        for domain in (".x.com", ".twitter.com"):
+                            pw_cookies.append(
+                                {
+                                    "name": str(name),
+                                    "value": str(val),
+                                    "domain": domain,
+                                    "path": "/",
+                                    "secure": True,
+                                    "httpOnly": name == "auth_token",
+                                    "sameSite": "Lax",
+                                }
+                            )
+                    proxy_cfg = {"server": proxy_url} if proxy_url else None
+                    async with async_playwright() as p:
+                        browser = await p.chromium.launch(headless=True, proxy=proxy_cfg)
+                        try:
+                            context = await browser.new_context(user_agent=user_agent)
+                            await context.add_cookies(pw_cookies)
+                            page = await context.new_page()
+
+                            async def handle_pw_resp(response):
+                                if "UserByScreenName" in response.url and response.status == 200:
+                                    try:
+                                        user_payloads.append(await response.json())
+                                    except Exception:
+                                        pass
+                                elif ("UserTweets" in response.url or "UserTweetsAndReplies" in response.url) and response.status == 200:
+                                    try:
+                                        tweets_payloads.append(await response.json())
+                                    except Exception:
+                                        pass
+
+                            page.on("response", handle_pw_resp)
+                            await page.goto(f"https://x.com/{clean_username}", wait_until="domcontentloaded", timeout=25000)
+                            await page.wait_for_timeout(3500)
+
+                            if "/login" in page.url or "/i/flow/login" in page.url:
+                                raise ScraperError("x session rejected", "X redirected to login flow (session cookies expired)", status_code=401)
+                        finally:
+                            await browser.close()
+
+                    for u_pay in user_payloads:
+                        u_res = ((u_pay.get("data") or {}).get("user") or {}).get("result") or {}
+                        u_leg = u_res.get("legacy") or {}
+                        if u_leg:
+                            profile_meta.update(
+                                {
+                                    "username": f"@{u_leg.get('screen_name') or clean_username}",
+                                    "url": f"https://x.com/{u_leg.get('screen_name') or clean_username}",
+                                    "full_name": u_leg.get("name") or clean_username,
+                                    "bio": u_leg.get("description"),
+                                    "followers": int(u_leg.get("followers_count") or 0),
+                                    "following": int(u_leg.get("friends_count") or 0),
+                                    "total_posts": int(u_leg.get("statuses_count") or 0),
+                                    "is_verified": bool(u_res.get("is_blue_verified") or u_leg.get("verified")),
+                                }
+                            )
+
+                    seen_tw = set()
+                    for t_pay in tweets_payloads:
+                        tl = ((((t_pay.get("data") or {}).get("user") or {}).get("result") or {}).get("timeline_v2") or {}).get("timeline") or {}
+                        for inst in tl.get("instructions") or []:
+                            entries = inst.get("entries") or ([inst["entry"]] if inst.get("entry") else [])
+                            for entry in entries:
+                                ic = (entry.get("content") or {}).get("itemContent") or {}
+                                tr = self._unwrap_tweet_result((ic.get("tweet_results") or {}).get("result"))
+                                if not tr:
+                                    continue
+                                leg = tr.get("legacy") or {}
+                                tw_id = str(leg.get("id_str") or tr.get("rest_id") or "")
+                                if not tw_id or tw_id in seen_tw:
+                                    continue
+                                seen_tw.add(tw_id)
+                                pub_dt = _parse_x_created_at(leg.get("created_at"))
+                                posts.append(
+                                    {
+                                        "post_index": len(posts) + 1,
+                                        "shortcode": tw_id,
+                                        "tweet_id": tw_id,
+                                        "url": f"https://x.com/{clean_username}/status/{tw_id}",
+                                        "caption": (leg.get("full_text") or "")[:200],
+                                        "comment_count": int(leg.get("reply_count") or 0),
+                                        "like_count": int(leg.get("favorite_count") or 0),
+                                        "retweet_count": int(leg.get("retweet_count") or 0),
+                                        "published_at": pub_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                                    }
+                                )
+                                if len(posts) >= count:
+                                    break
+                            if len(posts) >= count:
+                                break
+
+                if posts:
+                    return profile_meta, posts[:count]
+
+            except ScraperError as s_err:
+                if s_err.error_code == "x session rejected" and self.pool_manager:
+                    await self.pool_manager.report_session_error(session_obj.id)
+                elif s_err.error_code == "rate limited" and self.pool_manager:
+                    await self.pool_manager.report_rate_limit(session_obj.id, cooldown_minutes=15)
+                raise
+
+        # Engine 2: Official X API v2 Bearer Token
+        if self.bearer_token:
+            raw_token = urllib.parse.unquote(self.bearer_token or "").strip()
+            if raw_token.lower().startswith("bearer "):
+                raw_token = raw_token[7:].strip()
+            headers = {"Authorization": f"Bearer {raw_token}", "User-Agent": "OperativesMonitor/2.0"}
+            async with httpx.AsyncClient(headers=headers, timeout=20.0) as client:
+                u_resp = await client.get(
+                    f"https://api.x.com/2/users/by/username/{clean_username}",
+                    params={"user.fields": "id,name,username,description,public_metrics,verified"},
+                )
+                if u_resp.status_code in (401, 403):
+                    raise ScraperError("x session rejected", "X API v2 Bearer Token rejected", status_code=401)
+                if u_resp.status_code == 429:
+                    raise ScraperError("rate limited", "X API v2 rate limit exceeded", status_code=429)
+                if u_resp.status_code == 200:
+                    u_data = (u_resp.json() or {}).get("data")
+                    if not u_data:
+                        raise ScraperError("profile not found", f"X user @{clean_username} not found", status_code=404)
+                    uid = u_data["id"]
+                    p_metrics = u_data.get("public_metrics") or {}
+                    profile_meta.update(
+                        {
+                            "username": f"@{u_data.get('username') or clean_username}",
+                            "url": f"https://x.com/{u_data.get('username') or clean_username}",
+                            "full_name": u_data.get("name") or clean_username,
+                            "bio": u_data.get("description"),
+                            "followers": p_metrics.get("followers_count", 0),
+                            "following": p_metrics.get("following_count", 0),
+                            "total_posts": p_metrics.get("tweet_count", 0),
+                            "is_verified": bool(u_data.get("verified")),
+                        }
+                    )
+                    t_resp = await client.get(
+                        f"https://api.x.com/2/users/{uid}/tweets",
+                        params={
+                            "max_results": min(100, max(5, count)),
+                            "tweet.fields": "id,text,created_at,public_metrics",
+                            "exclude": "retweets,replies",
+                        },
+                    )
+                    if t_resp.status_code == 200:
+                        for tw in (t_resp.json() or {}).get("data") or []:
+                            tw_id = str(tw.get("id") or "")
+                            if not tw_id:
+                                continue
+                            tm = tw.get("public_metrics") or {}
+                            pub_dt = _parse_x_created_at(tw.get("created_at"))
+                            posts.append(
+                                {
+                                    "post_index": len(posts) + 1,
+                                    "shortcode": tw_id,
+                                    "tweet_id": tw_id,
+                                    "url": f"https://x.com/{clean_username}/status/{tw_id}",
+                                    "caption": (tw.get("text") or "")[:200],
+                                    "comment_count": tm.get("reply_count", 0),
+                                    "like_count": tm.get("like_count", 0),
+                                    "retweet_count": tm.get("retweet_count", 0),
+                                    "published_at": pub_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                                }
+                            )
+                            if len(posts) >= count:
+                                break
+            return profile_meta, posts[:count]
+
+        return profile_meta, posts
+
+    async def fetch_profile_recent_posts(self, username: str, count: int = 5) -> List[Dict[str, Any]]:
+        """Return only the recent posts list for an X profile."""
+        _, posts = await self.fetch_profile_info_and_posts(username, count=count)
+        return posts
+

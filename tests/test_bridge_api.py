@@ -586,3 +586,58 @@ async def test_bridge_x_scrape_replies_and_explicit_errors(bridge_client, monkey
     sess_data = await sess_resp.json()
     assert sess_data["sessions"][0]["error_count"] == 1
 
+    # 6. Test X profile enumeration + multi-post reply analysis (/api/profile and /api/posts on https://x.com/ozodlik)
+    async def mock_x_profile_info(self, username, count=5):
+        return (
+            {
+                "platform": "x",
+                "username": f"@{username.lstrip('@')}",
+                "url": f"https://x.com/{username.lstrip('@')}",
+                "full_name": "Ozodlik Radiosi",
+                "bio": "Official X news account",
+                "followers": 120000,
+                "following": 150,
+                "total_posts": 45000,
+                "is_verified": True,
+            },
+            [
+                {
+                    "post_index": 1,
+                    "shortcode": "2111136681747452363",
+                    "tweet_id": "2111136681747452363",
+                    "url": "https://x.com/ozodlik/status/2111136681747452363",
+                    "caption": "First recent X post",
+                    "comment_count": 2,
+                    "like_count": 42,
+                    "published_at": "2026-10-28 12:00:00",
+                },
+                {
+                    "post_index": 2,
+                    "shortcode": "2113589268937421273",
+                    "tweet_id": "2113589268937421273",
+                    "url": "https://x.com/ozodlik/status/2113589268937421273",
+                    "caption": "Second recent X post",
+                    "comment_count": 0,
+                    "like_count": 10,
+                    "published_at": "2026-10-28 13:00:00",
+                },
+            ][:count],
+        )
+
+    monkeypatch.setattr(TwitterXCollector, "fetch_profile_info_and_posts", mock_x_profile_info)
+
+    x_posts_resp = await bridge_client.get("/api/posts?target=https://x.com/ozodlik")
+    assert x_posts_resp.status == 200
+    x_posts_data = await x_posts_resp.json()
+    assert x_posts_data["profile"]["platform"] == "x"
+    assert len(x_posts_data["recent_posts"]) == 2
+
+    x_prof_resp = await bridge_client.post("/api/profile", json={"handle": "https://x.com/ozodlik", "posts": 2})
+    assert x_prof_resp.status == 200
+    x_prof_data = await x_prof_resp.json()
+    assert x_prof_data["profile"]["platform"] == "x"
+    assert x_prof_data["cadence_and_engagement"]["posts_analyzed"] == 2
+    assert x_prof_data["comment_stats"]["total_stored"] == 2
+    assert x_prof_data["comment_stats"]["flagged_count"] == 1
+
+

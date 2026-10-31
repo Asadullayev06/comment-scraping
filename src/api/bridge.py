@@ -138,6 +138,30 @@ def _extract_instagram_profile_username(raw_input: str) -> Optional[str]:
     return None
 
 
+def _extract_x_profile_username(raw_input: str, explicit_platform: str = "") -> Optional[str]:
+    """Return X (Twitter) profile username if raw_input is an X profile URL or handle (without /status/)."""
+    text = raw_input.strip()
+    if not text or text.lower() == "list":
+        return None
+
+    lower = text.lower()
+    if "/status/" in lower or "/i/" in lower:
+        return None
+
+    if "x.com/" in lower or "twitter.com/" in lower:
+        m = re.search(r"(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})(?:[/?#]|$)", text)
+        if m and m.group(1).lower() not in ("home", "explore", "search", "notifications", "messages", "settings", "i", "intent", "compose"):
+            return m.group(1)
+        return None
+
+    if explicit_platform in ("x", "twitter"):
+        candidate = text.lstrip("@").strip()
+        if re.match(r"^[A-Za-z0-9_]{1,15}$", candidate):
+            return candidate
+
+    return None
+
+
 async def _resolve_target(session: AsyncSession, raw_target: str) -> Optional[MonitoredTarget]:
     """Resolve a MonitoredTarget by UUID, external_id, @handle, or full URL."""
     clean = raw_target.strip()
@@ -563,6 +587,34 @@ async def _fetch_ig_profile_and_posts(
     return meta, posts
 
 
+async def _fetch_x_profile_and_posts(
+    x_collector: TwitterXCollector,
+    username: str,
+    count: int = 5,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Fetch X profile metadata and recent tweets, supporting both full and monkeypatched collectors."""
+    if getattr(TwitterXCollector.fetch_profile_recent_posts, "__name__", "") != "fetch_profile_recent_posts":
+        posts = await x_collector.fetch_profile_recent_posts(username, count=count)
+        meta = {
+            "platform": "x",
+            "username": f"@{username.lstrip('@')}",
+            "url": f"https://x.com/{username.lstrip('@')}",
+            "full_name": username.lstrip("@"),
+            "bio": None,
+            "followers": None,
+            "following": None,
+            "total_posts": len(posts),
+            "is_verified": False,
+        }
+        return meta, posts
+
+    meta, posts = await x_collector.fetch_profile_info_and_posts(username, count=count)
+    if not posts:
+        posts = await x_collector.fetch_profile_recent_posts(username, count=count)
+    meta["posts_returned"] = len(posts)
+    return meta, posts
+
+
 async def _execute_profile_analysis(
     ig_username: str,
     posts_count: int = 3,
@@ -570,18 +622,35 @@ async def _execute_profile_analysis(
     scrape_comments: bool = True,
     monitor: bool = False,
     mtproto: Optional[Any] = None,
+    platform: str = "instagram",
 ) -> Tuple[Optional[Dict[str, Any]], int]:
-    """Enumerate an Instagram profile's last N posts, scrape & score comments on each, and aggregate."""
+    """Enumerate an Instagram or X profile's last N posts, scrape & score comments/replies on each, and aggregate."""
     posts_count = min(max(1, posts_count), 5)  # Hard cap at 5 posts to protect burner session
 
     async with async_session_factory() as session:
-        pool_mgr = SessionPoolManager(session)
-        ig_collector = InstagramCollector(pool_mgr)
-        profile_meta, recent_posts = await _fetch_ig_profile_and_posts(
-            ig_collector,
-            ig_username,
-            count=max(5, posts_count),
-        )
+        s_repo = SessionRepository(session)
+        if platform == "x":
+            x_sess = await s_repo.get_healthy_session("x")
+            if not x_sess and not settings.X_BEARER_TOKEN:
+                raise ScraperError("no x session configured", "No active X burner session or X_BEARER_TOKEN configured", status_code=409)
+            pool_mgr = SessionPoolManager(session)
+            x_collector = TwitterXCollector(pool_mgr)
+            profile_meta, recent_posts = await _fetch_x_profile_and_posts(
+                x_collector,
+                ig_username,
+                count=max(5, posts_count),
+            )
+        else:
+            ig_sess = await s_repo.get_healthy_session("instagram")
+            if not ig_sess:
+                raise ScraperError("no instagram session configured", "No active Instagram burner session configured", status_code=409)
+            pool_mgr = SessionPoolManager(session)
+            ig_collector = InstagramCollector(pool_mgr)
+            profile_meta, recent_posts = await _fetch_ig_profile_and_posts(
+                ig_collector,
+                ig_username,
+                count=max(5, posts_count),
+            )
 
     if not recent_posts:
         return None, 404
@@ -598,11 +667,11 @@ async def _execute_profile_analysis(
         async with async_session_factory() as session:
             t_repo = TargetRepository(session)
             target = await t_repo.create_or_activate(
-                platform="instagram",
+                platform=platform,
                 target_type="post_url",
                 external_id=shortcode,
                 url=post_url,
-                title_or_name=f"Instagram @{ig_username} ({shortcode})",
+                title_or_name=f"{platform.capitalize()} @{ig_username} ({shortcode})",
                 is_active=monitor,
             )
             await session.commit()
@@ -761,7 +830,7 @@ async def _execute_profile_analysis(
 
 
 async def handle_posts(request: web.Request) -> web.Response:
-    """GET /api/posts?target=@handle&count=5 — List recent posts of an Instagram profile without scraping comments."""
+    """GET /api/posts?target=@handle&count=5 — List recent posts of an Instagram or X profile without scraping comments."""
     target_input = (
         request.query.get("target")
         or request.query.get("handle")
@@ -769,24 +838,41 @@ async def handle_posts(request: web.Request) -> web.Response:
         or request.query.get("url")
         or ""
     ).strip()
+    explicit_platform = (request.query.get("platform") or "").strip().lower()
     count = min(max(1, int(request.query.get("count") or request.query.get("limit") or 5)), 10)
-    ig_username = _extract_instagram_profile_username(target_input)
-    if not ig_username:
+
+    x_username = _extract_x_profile_username(target_input, explicit_platform=explicit_platform)
+    ig_username = None if x_username else _extract_instagram_profile_username(target_input)
+
+    if not x_username and not ig_username:
         return web.json_response(
-            {"error": f"Provide a valid Instagram handle or profile URL (got '{target_input}')."},
+            {"error": f"Provide a valid Instagram or X handle/profile URL (got '{target_input}')."},
             status=400,
         )
 
-    async with async_session_factory() as session:
-        pool_mgr = SessionPoolManager(session)
-        ig_collector = InstagramCollector(pool_mgr)
-        profile_meta, recent_posts = await _fetch_ig_profile_and_posts(ig_collector, ig_username, count=count)
-        if not recent_posts:
-            return web.json_response(
-                {"error": f"Could not fetch posts for Instagram profile '@{ig_username}'."},
-                status=404,
-            )
-        return web.json_response({"profile": profile_meta, "recent_posts": recent_posts})
+    try:
+        async with async_session_factory() as session:
+            pool_mgr = SessionPoolManager(session)
+            if x_username:
+                x_collector = TwitterXCollector(pool_mgr)
+                profile_meta, recent_posts = await _fetch_x_profile_and_posts(x_collector, x_username, count=count)
+                if not recent_posts:
+                    return web.json_response(
+                        {"error": f"Could not fetch posts for X profile '@{x_username}'."},
+                        status=404,
+                    )
+                return web.json_response({"profile": profile_meta, "recent_posts": recent_posts})
+            else:
+                ig_collector = InstagramCollector(pool_mgr)
+                profile_meta, recent_posts = await _fetch_ig_profile_and_posts(ig_collector, ig_username, count=count)
+                if not recent_posts:
+                    return web.json_response(
+                        {"error": f"Could not fetch posts for Instagram profile '@{ig_username}'."},
+                        status=404,
+                    )
+                return web.json_response({"profile": profile_meta, "recent_posts": recent_posts})
+    except ScraperError as s_err:
+        return web.json_response({"error": s_err.error_code, "message": s_err.message}, status=s_err.status_code)
 
 
 async def handle_profile(request: web.Request) -> web.Response:
@@ -812,10 +898,15 @@ async def handle_profile(request: web.Request) -> web.Response:
     if not raw_handle:
         return web.json_response({"error": "Missing required 'handle' or 'target' parameter."}, status=400)
 
-    ig_username = _extract_instagram_profile_username(raw_handle)
-    if not ig_username:
+    explicit_platform = (body.get("platform") or request.query.get("platform") or "").strip().lower()
+    x_username = _extract_x_profile_username(raw_handle, explicit_platform=explicit_platform)
+    ig_username = None if x_username else _extract_instagram_profile_username(raw_handle)
+    prof_username = x_username or ig_username
+    prof_platform = "x" if x_username else "instagram"
+
+    if not prof_username:
         return web.json_response(
-            {"error": f"Could not parse Instagram handle from '{raw_handle}'."},
+            {"error": f"Could not parse Instagram or X handle from '{raw_handle}'."},
             status=400,
         )
 
@@ -827,17 +918,24 @@ async def handle_profile(request: web.Request) -> web.Response:
     monitor = str(monitor_param).lower() in ("true", "1", "yes")
 
     mtproto = request.app.get("mtproto")
-    payload, status_code = await _execute_profile_analysis(
-        ig_username=ig_username,
-        posts_count=posts_count,
-        per_post_limit=per_post_limit,
-        scrape_comments=scrape_comments,
-        monitor=monitor,
-        mtproto=mtproto,
-    )
+    try:
+        payload, status_code = await _execute_profile_analysis(
+            ig_username=prof_username,
+            posts_count=posts_count,
+            per_post_limit=per_post_limit,
+            scrape_comments=scrape_comments,
+            monitor=monitor,
+            mtproto=mtproto,
+            platform=prof_platform,
+        )
+    except ScraperError as s_err:
+        return web.json_response(
+            {"error": s_err.error_code, "message": s_err.message, "platform": prof_platform},
+            status=s_err.status_code,
+        )
     if not payload:
         return web.json_response(
-            {"error": f"Could not fetch profile or posts for '@{ig_username}'."},
+            {"error": f"Could not fetch profile or posts for '@{prof_username}' on {prof_platform}."},
             status=status_code,
         )
     return web.json_response(payload)
@@ -903,13 +1001,15 @@ async def handle_check(request: web.Request) -> web.Response:
                 }
             )
 
-        # Check if target_input is an Instagram profile URL or @username handle
-        ig_username = _extract_instagram_profile_username(target_input)
+        # Check if target_input is an X or Instagram profile URL or @username handle
+        x_username = _extract_x_profile_username(target_input, explicit_platform=explicit_platform)
+        ig_username = None if x_username else _extract_instagram_profile_username(target_input)
         is_explicit_ig_profile = "instagram.com" in target_input.lower() and ig_username is not None
+        is_explicit_x_profile = ("x.com" in target_input.lower() or "twitter.com" in target_input.lower()) and x_username is not None
 
-        # Resolve existing monitored target first unless explicitly querying an Instagram profile URL/@handle
+        # Resolve existing monitored target first unless explicitly querying a profile URL/@handle
         target = None
-        if not is_explicit_ig_profile and explicit_platform != "instagram":
+        if not is_explicit_ig_profile and not is_explicit_x_profile and explicit_platform not in ("instagram", "x", "twitter"):
             if target_input.startswith("@"):
                 # Only match if an active Telegram target with this exact @handle has collected comments
                 stmt_tg = select(MonitoredTarget).where(
@@ -924,7 +1024,18 @@ async def handle_check(request: web.Request) -> web.Response:
             else:
                 target = await _resolve_target(session, target_input)
 
-        # If no existing post/chat target matched and ig_username is present, list the profile's last 5 posts
+        # If no existing post/chat target matched and x_username or ig_username is present, list the profile's last 5 posts
+        if not target and x_username:
+            pool_mgr = SessionPoolManager(session)
+            x_collector = TwitterXCollector(pool_mgr)
+            try:
+                profile_meta, recent_posts = await _fetch_x_profile_and_posts(x_collector, x_username, count=5)
+                if recent_posts:
+                    return web.json_response({"profile": profile_meta, "recent_posts": recent_posts})
+            except ScraperError as s_err:
+                return web.json_response({"error": s_err.error_code, "message": s_err.message, "platform": "x"}, status=s_err.status_code)
+            target = await _resolve_target(session, target_input)
+
         if not target and ig_username:
             pool_mgr = SessionPoolManager(session)
             ig_collector = InstagramCollector(pool_mgr)
@@ -994,23 +1105,104 @@ async def handle_scrape(request: web.Request) -> web.Response:
     resolved_post_meta: Optional[Dict[str, Any]] = None
     profile_meta: Optional[Dict[str, Any]] = None
     profile_recent_preview: Optional[List[Dict[str, Any]]] = None
-    ig_username = _extract_instagram_profile_username(raw_url) if explicit_platform != "telegram" else None
+    x_username = _extract_x_profile_username(raw_url, explicit_platform=explicit_platform)
+    ig_username = None if x_username else (_extract_instagram_profile_username(raw_url) if explicit_platform != "telegram" else None)
+    prof_username = x_username or ig_username
+    prof_platform = "x" if x_username else "instagram"
 
-    if ig_username and explicit_posts > 1:
+    if prof_username and explicit_posts > 1:
         mtproto = request.app.get("mtproto")
-        payload, status_code = await _execute_profile_analysis(
-            ig_username=ig_username,
-            posts_count=explicit_posts,
-            per_post_limit=min(limit, 120),
-            scrape_comments=True,
-            monitor=monitor,
-            mtproto=mtproto,
-        )
+        try:
+            payload, status_code = await _execute_profile_analysis(
+                ig_username=prof_username,
+                posts_count=explicit_posts,
+                per_post_limit=min(limit, 120),
+                scrape_comments=True,
+                monitor=monitor,
+                mtproto=mtproto,
+                platform=prof_platform,
+            )
+        except ScraperError as s_err:
+            return web.json_response(
+                {"error": s_err.error_code, "message": s_err.message, "platform": prof_platform},
+                status=s_err.status_code,
+            )
         if not payload:
-            return web.json_response({"error": f"Could not fetch profile '@{ig_username}'."}, status=status_code)
+            return web.json_response({"error": f"Could not fetch profile '@{prof_username}' on {prof_platform}."}, status=status_code)
         return web.json_response(payload)
 
-    if ig_username:
+    if x_username:
+        async with async_session_factory() as session:
+            s_repo = SessionRepository(session)
+            x_sess = await s_repo.get_healthy_session("x")
+            if not x_sess and not settings.X_BEARER_TOKEN:
+                return web.json_response(
+                    {
+                        "error": "no x session configured",
+                        "platform": "x",
+                        "hint": "Add an X burner session or set X_BEARER_TOKEN.",
+                    },
+                    status=409,
+                )
+            pool_mgr = SessionPoolManager(session)
+            x_collector = TwitterXCollector(pool_mgr)
+            try:
+                profile_meta, posts = await _fetch_x_profile_and_posts(
+                    x_collector,
+                    x_username,
+                    count=max(5, post_index),
+                )
+            except ScraperError as s_err:
+                return web.json_response(
+                    {"error": s_err.error_code, "message": s_err.message, "platform": "x"},
+                    status=s_err.status_code,
+                )
+            if not posts:
+                return web.json_response(
+                    {
+                        "error": f"Could not resolve recent posts for X profile '@{x_username}'.",
+                        "hint": "Verify the X username exists and an active X burner session is configured.",
+                    },
+                    status=404,
+                )
+            if post_index > len(posts):
+                return web.json_response(
+                    {
+                        "error": f"Requested post_index={post_index}, but X profile '@{x_username}' only returned {len(posts)} posts.",
+                        "recent_posts": posts,
+                    },
+                    status=400,
+                )
+
+            selected = posts[post_index - 1]
+            platform = "x"
+            target_type = "post_url"
+            external_id = selected["shortcode"]
+            clean_url = selected["url"]
+            target_title = f"X @{x_username} ({external_id})"
+            resolved_post_meta = {
+                "username": f"@{x_username}",
+                "post_index": post_index,
+                "shortcode": selected["shortcode"],
+                "url": selected["url"],
+                "caption": selected.get("caption"),
+                "published_at": selected.get("published_at"),
+                "comment_count": selected.get("comment_count", 0),
+                "like_count": selected.get("like_count", 0),
+            }
+            profile_recent_preview = [
+                {
+                    "post_index": p["post_index"],
+                    "shortcode": p["shortcode"],
+                    "url": p["url"],
+                    "comment_count": p.get("comment_count", 0),
+                    "like_count": p.get("like_count", 0),
+                    "published_at": p.get("published_at"),
+                    "caption": _truncate(p.get("caption"), 70),
+                }
+                for p in posts[:5]
+            ]
+    elif ig_username:
         async with async_session_factory() as session:
             pool_mgr = SessionPoolManager(session)
             ig_collector = InstagramCollector(pool_mgr)
