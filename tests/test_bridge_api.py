@@ -312,4 +312,8 @@ async def test_bridge_x_409_and_detailed_health(bridge_client):
     assert add_resp.status == 200
     add_data = await add_resp.json()
     assert add_data["added_session"] == "x_burner_1"
-    assert add_data["total_burner_sessions"] == 2
+    assert add_data["total_burner_sessions"] == 1
+
+    h_resp2 = await bridge_client.get("/health/detailed")
+    h_data2 = await h_resp2.json()
+    assert h_data2["platforms_ready"]["x"] is True
