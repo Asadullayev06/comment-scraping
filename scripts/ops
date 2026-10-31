@@ -110,22 +110,33 @@ def build_parser() -> argparse.ArgumentParser:
     # 2. ops check
     p_check = sub.add_parser(
         "check",
-        help="Inspect a monitored post/channel by ID, @handle, or URL (omit target to list all targets).",
+        help="Inspect a monitored post/channel or list an Instagram profile's last 5 posts (@username).",
     )
     p_check.add_argument(
         "target",
         nargs="?",
         default="list",
-        help="Target UUID, shortcode, @channel, or URL (default: 'list' all monitored targets)",
+        help="Target UUID, shortcode, @username, or URL (default: 'list' all monitored targets)",
     )
     p_check.add_argument("--limit", type=int, default=10, help="Max flagged comments to include (default: 10)")
 
     # 3. ops scrape
     p_scrape = sub.add_parser(
         "scrape",
-        help="Add/trigger an immediate scrape + DeepSeek batch evaluation for a URL or @channel.",
+        help="Scrape + evaluate a post URL or an Instagram profile (@username -> latest or Nth post).",
     )
-    p_scrape.add_argument("url", type=str, help="Full post URL (Instagram/YouTube/X/FB) or Telegram @channel")
+    p_scrape.add_argument(
+        "url",
+        type=str,
+        help="Post URL, Instagram profile (@username / instagram.com/username), or Telegram @channel",
+    )
+    p_scrape.add_argument(
+        "--post-index",
+        "-i",
+        type=int,
+        default=1,
+        help="For Instagram profiles: 1 = most recent post (default), 2 = 2nd most recent, etc.",
+    )
     p_scrape.add_argument(
         "--no-wait",
         action="store_true",
@@ -186,6 +197,7 @@ def main():
             method="POST",
             body={
                 "url": args.url,
+                "post_index": args.post_index,
                 "wait": not args.no_wait,
                 "limit": args.limit,
             },

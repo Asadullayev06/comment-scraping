@@ -173,3 +173,84 @@ async def test_bridge_sessions(bridge_client):
     assert data["total_burner_sessions"] == 1
     assert data["sessions"][0]["account"] == "burner_ig_1"
     assert data["sessions"][0]["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_bridge_instagram_profile_check_and_scrape(bridge_client, monkeypatch):
+    """Verify GET /api/check?target=@username lists last 5 posts and POST /api/scrape with @username targets latest post."""
+    from datetime import datetime, timezone
+    from src.collectors.instagram import InstagramCollector
+    from src.schemas.comment import NormalizedComment
+
+    fake_posts = [
+        {
+            "post_index": 1,
+            "shortcode": "LatestPost111",
+            "media_id": "111111",
+            "url": "https://www.instagram.com/p/LatestPost111/",
+            "thumbnail_url": "https://cdn.instagram.com/thumb1.jpg",
+            "caption": "Eng so'nggi yangiliklar: yangi soliq va jarima tartibi e'lon qilindi.",
+            "comment_count": 45,
+            "like_count": 320,
+            "published_at": "2026-10-31 11:00",
+        },
+        {
+            "post_index": 2,
+            "shortcode": "SecondPost222",
+            "media_id": "222222",
+            "url": "https://www.instagram.com/p/SecondPost222/",
+            "thumbnail_url": "https://cdn.instagram.com/thumb2.jpg",
+            "caption": "Ikkinchi post matni.",
+            "comment_count": 18,
+            "like_count": 150,
+            "published_at": "2026-10-30 19:30",
+        },
+    ]
+
+    async def mock_fetch_profile_recent_posts(self, username: str, count: int = 5):
+        return fake_posts[:count]
+
+    async def mock_fetch_comments(self, target, cursor=None, limit=200):
+        yield NormalizedComment(
+            platform="instagram",
+            external_comment_id=f"ig_c_{target.external_id}_1",
+            target_external_id=target.external_id,
+            source_name=f"Instagram Post {target.external_id}",
+            post_url=target.url,
+            comment_url=f"https://www.instagram.com/p/{target.external_id}/c/9001/",
+            author_external_id="554433",
+            author_username="citizen_uz",
+            author_display_name="Azizbek",
+            content_text="Bu yangi jarima qonuni xalqni talash va zulm qilish uchundir, boykot!",
+            published_at=datetime.now(timezone.utc),
+        )
+
+    monkeypatch.setattr(InstagramCollector, "fetch_profile_recent_posts", mock_fetch_profile_recent_posts)
+    monkeypatch.setattr(InstagramCollector, "fetch_comments", mock_fetch_comments)
+
+    # 1. Test GET /api/check?target=@kun.uz
+    check_resp = await bridge_client.get("/api/check?target=@kun.uz")
+    assert check_resp.status == 200
+    check_data = await check_resp.json()
+    assert check_data["profile"]["username"] == "@kun.uz"
+    assert len(check_data["recent_posts"]) == 2
+    assert check_data["recent_posts"][0]["shortcode"] == "LatestPost111"
+    assert check_data["recent_posts"][0]["post_index"] == 1
+
+    # 2. Test POST /api/scrape with "@kun.uz" (default post_index=1 -> LatestPost111)
+    scrape_resp = await bridge_client.post("/api/scrape", json={"url": "@kun.uz"})
+    assert scrape_resp.status == 200
+    scrape_data = await scrape_resp.json()
+    assert scrape_data["resolved_post"]["shortcode"] == "LatestPost111"
+    assert scrape_data["resolved_post"]["post_index"] == 1
+    assert "yangi soliq" in scrape_data["resolved_post"]["caption"]
+    assert scrape_data["resolved_post"]["published_at"] == "2026-10-31 11:00"
+    assert scrape_data["scrape_result"]["newly_ingested"] == 1
+    assert scrape_data["stats"]["evaluated"] == 1
+
+    # 3. Test POST /api/scrape with post_index=2 -> SecondPost222
+    scrape_resp2 = await bridge_client.post("/api/scrape", json={"url": "instagram.com/kun.uz", "post_index": 2})
+    assert scrape_resp2.status == 200
+    scrape_data2 = await scrape_resp2.json()
+    assert scrape_data2["resolved_post"]["shortcode"] == "SecondPost222"
+    assert scrape_data2["resolved_post"]["post_index"] == 2

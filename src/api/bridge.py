@@ -1,5 +1,6 @@
 """Lightweight internal HTTP bridge exposing token-safe (< 3 KB) endpoints for Hermes CLI (ops)."""
 
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from aiohttp import web
@@ -101,6 +102,37 @@ def _cluster_duplicates(items: List[Dict[str, Any]], limit: int) -> List[Dict[st
         else:
             clustered[norm_key]["occurrences"] += 1
     return list(clustered.values())[:limit]
+
+
+def _extract_instagram_profile_username(raw_input: str) -> Optional[str]:
+    """Return Instagram profile username if raw_input is a profile URL or handle (without /p/ or /reel/)."""
+    text = raw_input.strip()
+    if not text or text.lower() == "list":
+        return None
+
+    lower = text.lower()
+    if any(d in lower for d in ("t.me/", "youtube.com", "youtu.be", "x.com/", "twitter.com/", "facebook.com", "fb.watch")):
+        return None
+
+    if "instagram.com" in lower:
+        if re.search(r"/(?:p|reel|reels|tv|stories)/[A-Za-z0-9_-]+", text):
+            return None
+        m = re.search(r"instagram\.com/([A-Za-z0-9._]+)", text)
+        if m and m.group(1).lower() not in ("p", "reel", "reels", "tv", "stories", "explore", "accounts"):
+            return m.group(1)
+        return None
+
+    if "://" in text or "/" in text or text.lstrip("-").isdigit():
+        return None
+
+    # Exclude UUID strings
+    if re.match(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", text):
+        return None
+
+    candidate = text.lstrip("@").strip()
+    if re.match(r"^[A-Za-z0-9._]{2,30}$", candidate):
+        return candidate
+    return None
 
 
 async def _resolve_target(session: AsyncSession, raw_target: str) -> Optional[MonitoredTarget]:
@@ -442,9 +474,10 @@ async def handle_digest(request: web.Request) -> web.Response:
 
 
 async def handle_check(request: web.Request) -> web.Response:
-    """GET /api/check?target=<id_or_url>&limit=10"""
+    """GET /api/check?target=<id_or_url_or_@handle>&limit=10"""
     target_input = request.query.get("target", "").strip()
     limit = min(max(1, int(request.query.get("limit", 10))), 12)
+    explicit_platform = request.query.get("platform", "").strip().lower()
 
     async with async_session_factory() as session:
         if not target_input or target_input == "list":
@@ -467,13 +500,53 @@ async def handle_check(request: web.Request) -> web.Response:
                 }
             )
 
-        target = await _resolve_target(session, target_input)
+        # Check if target_input is an Instagram profile URL or @username handle
+        ig_username = _extract_instagram_profile_username(target_input)
+        is_explicit_ig_profile = "instagram.com" in target_input.lower() and ig_username is not None
+
+        # Resolve existing monitored target first unless explicitly querying an Instagram profile URL/@handle
+        target = None
+        if not is_explicit_ig_profile and explicit_platform != "instagram":
+            if target_input.startswith("@"):
+                # Only match if an active Telegram target with this exact @handle has collected comments
+                stmt_tg = select(MonitoredTarget).where(
+                    MonitoredTarget.platform == "telegram",
+                    or_(
+                        MonitoredTarget.external_id == target_input,
+                        MonitoredTarget.external_id == target_input.lstrip("@"),
+                    ),
+                    MonitoredTarget.total_comments_collected > 0,
+                )
+                target = (await session.execute(stmt_tg)).scalars().first()
+            else:
+                target = await _resolve_target(session, target_input)
+
+        # If no existing post/chat target matched and ig_username is present, list the profile's last 5 posts
+        if not target and ig_username:
+            pool_mgr = SessionPoolManager(session)
+            ig_collector = InstagramCollector(pool_mgr)
+            recent_posts = await ig_collector.fetch_profile_recent_posts(ig_username, count=5)
+            if recent_posts:
+                return web.json_response(
+                    {
+                        "profile": {
+                            "platform": "instagram",
+                            "username": f"@{ig_username}",
+                            "url": f"https://www.instagram.com/{ig_username}/",
+                            "posts_returned": len(recent_posts),
+                        },
+                        "recent_posts": recent_posts,
+                    }
+                )
+            # Fall back to checking DB if profile fetch returned empty (e.g. offline/test environment)
+            target = await _resolve_target(session, target_input)
+
         if not target:
             t_repo = TargetRepository(session)
             targets = await t_repo.list_all(limit=15)
             return web.json_response(
                 {
-                    "error": f"Target '{target_input}' not found.",
+                    "error": f"Target or Instagram profile '{target_input}' not found.",
                     "available_targets": [
                         {"id": t.id, "platform": t.platform, "external_id": t.external_id, "title": t.title_or_name}
                         for t in targets
@@ -491,7 +564,7 @@ async def handle_check(request: web.Request) -> web.Response:
 
 
 async def handle_scrape(request: web.Request) -> web.Response:
-    """POST /api/scrape (body or query: url, wait=true, limit=200)"""
+    """POST /api/scrape (body or query: url, post_index=1, wait=true, limit=200)"""
     body = {}
     if request.can_read_body:
         try:
@@ -499,20 +572,74 @@ async def handle_scrape(request: web.Request) -> web.Response:
         except Exception:
             body = {}
 
-    raw_url = (body.get("url") or request.query.get("url") or "").strip()
+    raw_url = (
+        body.get("url")
+        or body.get("target")
+        or request.query.get("url")
+        or request.query.get("target")
+        or ""
+    ).strip()
     if not raw_url:
         return web.json_response({"error": "Missing required 'url' parameter."}, status=400)
 
     wait_param = body.get("wait", request.query.get("wait", "true"))
     wait = str(wait_param).lower() not in ("false", "0", "no")
     limit = min(max(10, int(body.get("limit") or request.query.get("limit") or 200)), 1000)
+    post_index = max(1, int(body.get("post_index") or request.query.get("post_index") or 1))
+    explicit_platform = (body.get("platform") or request.query.get("platform") or "").strip().lower()
 
-    platform, target_type, external_id, clean_url = detect_platform_and_id(raw_url)
-    if not platform or not external_id:
-        return web.json_response(
-            {"error": f"Could not detect platform or ID from '{raw_url}'."},
-            status=400,
-        )
+    resolved_post_meta: Optional[Dict[str, Any]] = None
+    ig_username = _extract_instagram_profile_username(raw_url) if explicit_platform != "telegram" else None
+
+    if ig_username:
+        async with async_session_factory() as session:
+            pool_mgr = SessionPoolManager(session)
+            ig_collector = InstagramCollector(pool_mgr)
+            posts = await ig_collector.fetch_profile_recent_posts(
+                ig_username,
+                count=max(5, post_index),
+            )
+            if not posts:
+                return web.json_response(
+                    {
+                        "error": f"Could not resolve recent posts for Instagram profile '@{ig_username}'.",
+                        "hint": "Verify the Instagram username exists and an active burner session is configured.",
+                    },
+                    status=404,
+                )
+            if post_index > len(posts):
+                return web.json_response(
+                    {
+                        "error": f"Requested post_index={post_index}, but profile '@{ig_username}' only returned {len(posts)} posts.",
+                        "recent_posts": posts,
+                    },
+                    status=400,
+                )
+
+            selected = posts[post_index - 1]
+            platform = "instagram"
+            target_type = "post_url"
+            external_id = selected["shortcode"]
+            clean_url = selected["url"]
+            target_title = f"Instagram @{ig_username} ({external_id})"
+            resolved_post_meta = {
+                "username": f"@{ig_username}",
+                "post_index": post_index,
+                "shortcode": selected["shortcode"],
+                "url": selected["url"],
+                "caption": selected.get("caption"),
+                "published_at": selected.get("published_at"),
+                "comment_count": selected.get("comment_count", 0),
+                "like_count": selected.get("like_count", 0),
+            }
+    else:
+        platform, target_type, external_id, clean_url = detect_platform_and_id(raw_url)
+        if not platform or not external_id:
+            return web.json_response(
+                {"error": f"Could not detect platform or ID from '{raw_url}'."},
+                status=400,
+            )
+        target_title = f"{platform.capitalize()} Target: {external_id}"
 
     async with async_session_factory() as session:
         t_repo = TargetRepository(session)
@@ -521,7 +648,7 @@ async def handle_scrape(request: web.Request) -> web.Response:
             target_type=target_type,
             external_id=external_id,
             url=clean_url,
-            title_or_name=f"{platform.capitalize()} Target: {external_id}",
+            title_or_name=target_title,
         )
         await session.commit()
         target_id = target.id
@@ -539,15 +666,16 @@ async def handle_scrape(request: web.Request) -> web.Response:
         except Exception as q_err:
             logger.warning("Failed to enqueue job to Arq; running inline fallback", error=str(q_err))
 
-        return web.json_response(
-            {
-                "status": "enqueued",
-                "target_id": target_id,
-                "platform": platform,
-                "external_id": external_id,
-                "url": clean_url,
-            }
-        )
+        resp_payload: Dict[str, Any] = {
+            "status": "enqueued",
+            "target_id": target_id,
+            "platform": platform,
+            "external_id": external_id,
+            "url": clean_url,
+        }
+        if resolved_post_meta:
+            resp_payload["resolved_post"] = resolved_post_meta
+        return web.json_response(resp_payload)
 
     # Synchronous scrape + DeepSeek batch evaluation
     newly_inserted, evaluated = await _execute_inline_scrape(target_id, mtproto=mtproto, limit=limit)
@@ -556,6 +684,8 @@ async def handle_scrape(request: web.Request) -> web.Response:
         t_repo = TargetRepository(session)
         updated_target = await t_repo.get_by_id(target_id)
         payload = await _build_target_check_payload(session, updated_target, flagged_limit=10, sample_limit=6)
+        if resolved_post_meta:
+            payload["resolved_post"] = resolved_post_meta
         payload["scrape_result"] = {
             "status": "completed",
             "newly_ingested": newly_inserted,

@@ -76,6 +76,189 @@ class InstagramCollector(BaseCollector):
 
         return cl
 
+    async def fetch_profile_recent_posts(
+        self,
+        username: str,
+        count: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Fetch a user's latest N posts by handle/username, sorted newest-first (1 = most recent).
+
+        Uses Instagram Web REST API (/api/v1/feed/user/<username>/username/ and web_profile_info)
+        with fallback to instagrapi mobile API (user_medias_v1).
+        """
+        clean_username = username.strip().lstrip("@").split("?")[0].strip("/")
+        if "instagram.com/" in clean_username:
+            clean_username = clean_username.split("instagram.com/")[-1].split("/")[0].lstrip("@")
+
+        if not clean_username:
+            return []
+
+        session_data: Any = {}
+        proxy_url: Optional[str] = None
+        if self.pool_manager:
+            session_tuple = await self.pool_manager.acquire_session("instagram")
+            if session_tuple:
+                _, session_data, proxy_url = session_tuple
+
+        session_val = session_data.get("sessionid") if isinstance(session_data, dict) else (str(session_data) if session_data else "")
+        user_match = re.search(r"^(\d+)", session_val) if session_val else None
+        user_id = user_match.group(1) if user_match else ""
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "x-ig-app-id": "936619743392459",
+            "x-asbd-id": "129477",
+            "x-requested-with": "XMLHttpRequest",
+            "Referer": f"https://www.instagram.com/{clean_username}/",
+        }
+        cookies = {}
+        if session_val:
+            cookies["sessionid"] = session_val
+        if user_id:
+            cookies["ds_user_id"] = user_id
+
+        # Fetch extra items so pinned older posts at the top of the grid don't displace actual newest posts
+        fetch_amount = max(count + 4, 12)
+        raw_posts: List[Dict[str, Any]] = []
+
+        transport = httpx.AsyncHTTPTransport(proxy=proxy_url) if proxy_url else None
+        async with httpx.AsyncClient(headers=headers, cookies=cookies, transport=transport, timeout=20.0) as client:
+            # Engine 1: Web REST User Feed API
+            try:
+                feed_url = f"https://www.instagram.com/api/v1/feed/user/{clean_username}/username/?count={fetch_amount}"
+                resp = await client.get(feed_url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = data.get("items", [])
+                    for item in items:
+                        shortcode = item.get("code")
+                        if not shortcode:
+                            continue
+                        media_pk = str(item.get("pk") or item.get("id") or shortcode)
+                        ts = int(item.get("taken_at") or 0)
+                        pub_dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts > 0 else None
+                        cap_obj = item.get("caption")
+                        caption_text = cap_obj.get("text", "") if isinstance(cap_obj, dict) else ""
+                        comment_count = int(item.get("comment_count") or 0)
+                        like_count = int(item.get("like_count") or 0)
+                        thumb_url = None
+                        img_v2 = item.get("image_versions2", {})
+                        candidates = img_v2.get("candidates", []) if isinstance(img_v2, dict) else []
+                        if candidates and isinstance(candidates[0], dict):
+                            thumb_url = candidates[0].get("url")
+
+                        raw_posts.append(
+                            {
+                                "shortcode": shortcode,
+                                "media_id": media_pk,
+                                "url": f"https://www.instagram.com/p/{shortcode}/",
+                                "thumbnail_url": thumb_url,
+                                "caption": " ".join(caption_text.split())[:160],
+                                "comment_count": comment_count,
+                                "like_count": like_count,
+                                "published_at": pub_dt.strftime("%Y-%m-%d %H:%M") if pub_dt else None,
+                                "timestamp": ts,
+                            }
+                        )
+            except Exception as e1:
+                logger.warning("Instagram Web Feed API failed; trying web_profile_info", username=clean_username, error=str(e1))
+
+            # Engine 2: Web Profile Info API fallback
+            if not raw_posts:
+                try:
+                    info_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={clean_username}"
+                    resp2 = await client.get(info_url)
+                    if resp2.status_code == 200:
+                        data2 = resp2.json()
+                        edges = (
+                            data2.get("data", {})
+                            .get("user", {})
+                            .get("edge_owner_to_timeline_media", {})
+                            .get("edges", [])
+                        )
+                        for edge in edges:
+                            node = edge.get("node", {})
+                            shortcode = node.get("shortcode")
+                            if not shortcode:
+                                continue
+                            media_pk = str(node.get("id") or shortcode)
+                            ts = int(node.get("taken_at_timestamp") or 0)
+                            pub_dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts > 0 else None
+                            cap_edges = node.get("edge_media_to_caption", {}).get("edges", [])
+                            caption_text = cap_edges[0].get("node", {}).get("text", "") if cap_edges else ""
+                            comment_count = int(node.get("edge_media_to_comment", {}).get("count") or 0)
+                            like_count = int(node.get("edge_liked_by", {}).get("count") or 0)
+                            thumb_url = node.get("thumbnail_src") or node.get("display_url")
+
+                            raw_posts.append(
+                                {
+                                    "shortcode": shortcode,
+                                    "media_id": media_pk,
+                                    "url": f"https://www.instagram.com/p/{shortcode}/",
+                                    "thumbnail_url": thumb_url,
+                                    "caption": " ".join(caption_text.split())[:160],
+                                    "comment_count": comment_count,
+                                    "like_count": like_count,
+                                    "published_at": pub_dt.strftime("%Y-%m-%d %H:%M") if pub_dt else None,
+                                    "timestamp": ts,
+                                }
+                            )
+                except Exception as e2:
+                    logger.warning("Instagram web_profile_info fallback failed", username=clean_username, error=str(e2))
+
+        # Engine 3: instagrapi mobile API fallback
+        if not raw_posts and session_data:
+            try:
+                cl = await asyncio.to_thread(self._init_client, session_data, proxy_url)
+                u_info = await asyncio.to_thread(cl.user_info_by_username_v1, clean_username)
+                medias = await asyncio.to_thread(cl.user_medias_v1, int(u_info.pk), fetch_amount)
+                for m in medias:
+                    shortcode = getattr(m, "code", None)
+                    if not shortcode:
+                        continue
+                    taken_at = getattr(m, "taken_at", None)
+                    if isinstance(taken_at, datetime):
+                        pub_dt = taken_at.astimezone(timezone.utc)
+                        ts = int(pub_dt.timestamp())
+                    else:
+                        pub_dt = None
+                        ts = 0
+                    caption_text = getattr(m, "caption_text", "") or ""
+                    thumb = getattr(m, "thumbnail_url", None)
+                    raw_posts.append(
+                        {
+                            "shortcode": shortcode,
+                            "media_id": str(getattr(m, "pk", shortcode)),
+                            "url": f"https://www.instagram.com/p/{shortcode}/",
+                            "thumbnail_url": str(thumb) if thumb else None,
+                            "caption": " ".join(caption_text.split())[:160],
+                            "comment_count": int(getattr(m, "comment_count", 0) or 0),
+                            "like_count": int(getattr(m, "like_count", 0) or 0),
+                            "published_at": pub_dt.strftime("%Y-%m-%d %H:%M") if pub_dt else None,
+                            "timestamp": ts,
+                        }
+                    )
+            except Exception as e3:
+                logger.warning("instagrapi mobile profile medias fallback failed", username=clean_username, error=str(e3))
+
+        if not raw_posts:
+            return []
+
+        # Deduplicate by shortcode and sort strictly newest-first by timestamp so pinned old posts don't skew index 1
+        deduped: Dict[str, Dict[str, Any]] = {}
+        for p in raw_posts:
+            sc = p["shortcode"]
+            if sc not in deduped:
+                deduped[sc] = p
+
+        sorted_posts = sorted(deduped.values(), key=lambda x: x.get("timestamp", 0), reverse=True)[:count]
+        for idx, post in enumerate(sorted_posts, start=1):
+            post["post_index"] = idx
+            post.pop("timestamp", None)
+
+        return sorted_posts
+
     async def _fetch_web_comments(
         self,
         shortcode: str,
