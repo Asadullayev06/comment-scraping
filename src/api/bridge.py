@@ -1734,188 +1734,222 @@ async def handle_sessions(request: web.Request) -> web.Response:
 
 async def handle_replies(request: web.Request) -> web.Response:
     """GET/POST /api/replies or /api/scrape/replies — Fetch an X user's own recent replies and score them via DeepSeek."""
-    body = {}
-    if request.can_read_body:
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-
-    raw_handle = (
-        body.get("handle")
-        or body.get("username")
-        or body.get("target")
-        or body.get("url")
-        or request.query.get("handle")
-        or request.query.get("username")
-        or request.query.get("target")
-        or request.query.get("url")
-        or ""
-    ).strip()
-    if not raw_handle:
-        return web.json_response({"error": "Missing required 'handle' or 'target' parameter."}, status=400)
-
-    # Always route to X for /api/replies (supports x.com/<user>, twitter.com/<user>, @handle, or bare handle)
-    x_username = _extract_x_profile_username(raw_handle, explicit_platform="x")
-    if not x_username:
-        return web.json_response(
-            {"error": f"Could not parse X handle from '{raw_handle}'."},
-            status=400,
-        )
-
-    limit = min(max(1, int(body.get("limit") or body.get("count") or request.query.get("limit") or request.query.get("count") or 20)), 100)
-
-    async with async_session_factory() as session:
-        s_repo = SessionRepository(session)
-        x_sess = await s_repo.get_healthy_session("x")
-        if not x_sess and not settings.X_BEARER_TOKEN:
-            return web.json_response(
-                {
-                    "error": "no x session configured",
-                    "platform": "x",
-                    "hint": "Add an X burner session or set X_BEARER_TOKEN.",
-                },
-                status=409,
-            )
-
-        burner_cookies: Dict[str, str] = {}
-        proxy_url = None
-        user_agent = None
-        if x_sess and x_sess.cookies_encrypted:
+    try:
+        body = {}
+        if request.can_read_body:
             try:
-                decrypted = s_repo.decrypt_data(x_sess.cookies_encrypted)
-                if isinstance(decrypted, dict):
-                    burner_cookies = {str(k): str(v) for k, v in decrypted.items() if v is not None}
-                elif isinstance(decrypted, str):
-                    raw_c = decrypted.strip()
-                    if raw_c.startswith("{"):
-                        import json as _json
-                        try:
-                            parsed_c = _json.loads(raw_c)
-                            if isinstance(parsed_c, dict):
-                                burner_cookies = {str(k): str(v) for k, v in parsed_c.items() if v is not None}
-                        except Exception:
+                body = await request.json()
+            except Exception:
+                body = {}
+
+        raw_handle = (
+            body.get("handle")
+            or body.get("username")
+            or body.get("target")
+            or body.get("url")
+            or request.query.get("handle")
+            or request.query.get("username")
+            or request.query.get("target")
+            or request.query.get("url")
+            or ""
+        ).strip()
+        if not raw_handle:
+            return web.json_response({"error": "Missing required 'handle' or 'target' parameter."}, status=400)
+
+        # Always route to X for /api/replies (supports x.com/<user>, twitter.com/<user>, @handle, or bare handle)
+        x_username = _extract_x_profile_username(raw_handle, explicit_platform="x")
+        if not x_username:
+            return web.json_response(
+                {"error": f"Could not parse X handle from '{raw_handle}'."},
+                status=400,
+            )
+
+        limit = min(max(1, int(body.get("limit") or body.get("count") or request.query.get("limit") or request.query.get("count") or 20)), 100)
+
+        async with async_session_factory() as session:
+            s_repo = SessionRepository(session)
+            x_sess = await s_repo.get_healthy_session("x")
+            if not x_sess and not settings.X_BEARER_TOKEN:
+                return web.json_response(
+                    {
+                        "error": "no x session configured",
+                        "platform": "x",
+                        "hint": "Add an X burner session or set X_BEARER_TOKEN.",
+                    },
+                    status=409,
+                )
+
+            burner_cookies: Dict[str, str] = {}
+            proxy_url = None
+            user_agent = None
+            if x_sess and x_sess.cookies_encrypted:
+                try:
+                    decrypted = s_repo.decrypt_data(x_sess.cookies_encrypted)
+                    if isinstance(decrypted, dict):
+                        burner_cookies = {str(k): str(v) for k, v in decrypted.items() if v is not None}
+                    elif isinstance(decrypted, str):
+                        raw_c = decrypted.strip()
+                        if raw_c.startswith("{"):
+                            import json as _json
+                            try:
+                                parsed_c = _json.loads(raw_c)
+                                if isinstance(parsed_c, dict):
+                                    burner_cookies = {str(k): str(v) for k, v in parsed_c.items() if v is not None}
+                            except Exception:
+                                burner_cookies = {"auth_token": raw_c}
+                        elif "=" in raw_c and ";" in raw_c:
+                            for part in raw_c.split(";"):
+                                if "=" in part:
+                                    k, v = part.split("=", 1)
+                                    burner_cookies[k.strip()] = v.strip()
+                        else:
                             burner_cookies = {"auth_token": raw_c}
-                    elif "=" in raw_c and ";" in raw_c:
-                        for part in raw_c.split(";"):
-                            if "=" in part:
-                                k, v = part.split("=", 1)
-                                burner_cookies[k.strip()] = v.strip()
-                    else:
-                        burner_cookies = {"auth_token": raw_c}
-                proxy_url = x_sess.proxy_url
-                user_agent = x_sess.user_agent
-            except Exception as dec_err:
-                logger.warning("Failed to decrypt X session cookies in handle_replies", error=str(dec_err))
+                    proxy_url = x_sess.proxy_url
+                    user_agent = x_sess.user_agent
+                except Exception as dec_err:
+                    logger.exception("Failed to decrypt X session cookies in handle_replies", error=str(dec_err), session_id=x_sess.id, exc_info=True)
+                    await s_repo.increment_error(x_sess.id)
+                    await session.commit()
+                    return web.json_response(
+                        {
+                            "error": "x session rejected",
+                            "message": f"Failed to decrypt stored X burner session cookies: {dec_err}",
+                            "platform": "x",
+                        },
+                        status=401,
+                    )
 
-        pool_mgr = SessionPoolManager(session)
-        x_collector = TwitterXCollector(
-            pool_mgr,
-            session_cookies=burner_cookies if burner_cookies else None,
-            proxy_url=proxy_url,
-            user_agent=user_agent,
-        )
-        try:
-            profile_meta, norm_replies = await x_collector.fetch_user_replies(x_username, count=limit)
-        except ScraperError as s_err:
-            return web.json_response(
-                {"error": s_err.error_code, "message": s_err.message, "platform": "x"},
-                status=s_err.status_code,
+            pool_mgr = SessionPoolManager(session)
+            x_collector = TwitterXCollector(
+                pool_mgr,
+                session_cookies=burner_cookies if burner_cookies else None,
+                proxy_url=proxy_url,
+                user_agent=user_agent,
             )
-        except Exception as err:
-            return web.json_response(
-                {"error": "replies fetch failed", "message": f"Failed to fetch replies for @{x_username}: {err}", "platform": "x"},
-                status=502,
-            )
+            try:
+                profile_meta, norm_replies = await x_collector.fetch_user_replies(x_username, count=limit)
+            except ScraperError as s_err:
+                return web.json_response(
+                    {"error": s_err.error_code, "message": s_err.message, "platform": "x"},
+                    status=s_err.status_code,
+                )
+            except Exception as err:
+                logger.exception("fetch_user_replies failed unexpectedly", username=x_username, error=str(err), exc_info=True)
+                return web.json_response(
+                    {"error": "replies fetch failed", "message": f"Failed to fetch replies for @{x_username}: {err}", "platform": "x"},
+                    status=502,
+                )
 
-        if not norm_replies:
-            return web.json_response(
-                {
-                    "error": "no replies found",
-                    "message": f"No recent replies found for @{x_username}.",
-                    "platform": "x",
-                    "profile": profile_meta,
-                },
-                status=404,
-            )
+            if not norm_replies:
+                return web.json_response(
+                    {
+                        "error": "no replies found",
+                        "message": f"No recent replies found for @{x_username}.",
+                        "platform": "x",
+                        "profile": profile_meta,
+                    },
+                    status=404,
+                )
 
-        t_repo = TargetRepository(session)
-        target = await t_repo.create_or_activate(
-            platform="x",
-            target_type="user_replies",
-            external_id=f"@{x_username}:replies",
-            url=f"https://x.com/{x_username}/with_replies",
-            title_or_name=f"X Replies by @{x_username}",
-            is_active=False,
-        )
-        await session.flush()
-
-        author_repo = AuthorRepository(session)
-        comment_repo = CommentRepository(session)
-        newly_inserted = 0
-
-        for norm_comment in norm_replies:
-            author = await author_repo.upsert_author(
+            t_repo = TargetRepository(session)
+            target = await t_repo.create_or_activate(
                 platform="x",
-                external_user_id=norm_comment.author_external_id,
-                username=norm_comment.author_username,
-                display_name=norm_comment.author_display_name,
-                profile_url=f"https://x.com/{x_username}",
+                target_type="user_replies",
+                external_id=f"@{x_username}:replies",
+                url=f"https://x.com/{x_username}/with_replies",
+                title_or_name=f"X Replies by @{x_username}",
+                is_active=False,
             )
-            comment = await comment_repo.insert_single(
-                platform="x",
-                external_comment_id=norm_comment.external_comment_id,
-                content_text=norm_comment.content_text,
+            await session.flush()
+
+            author_repo = AuthorRepository(session)
+            comment_repo = CommentRepository(session)
+            newly_inserted = 0
+
+            for norm_comment in norm_replies:
+                author = await author_repo.upsert_author(
+                    platform="x",
+                    external_user_id=norm_comment.author_external_id,
+                    username=norm_comment.author_username,
+                    display_name=norm_comment.author_display_name,
+                    profile_url=f"https://x.com/{x_username}",
+                )
+                comment = await comment_repo.insert_single(
+                    platform="x",
+                    external_comment_id=norm_comment.external_comment_id,
+                    content_text=norm_comment.content_text,
+                    target_id=target.id,
+                    author_id=author.id,
+                    parent_external_id=norm_comment.parent_external_id,
+                    source_name=norm_comment.source_name,
+                    post_url=norm_comment.post_url,
+                    comment_url=norm_comment.comment_url,
+                    published_at=norm_comment.published_at,
+                    child_comment_count=norm_comment.child_comment_count,
+                )
+                if comment:
+                    newly_inserted += 1
+
+            await t_repo.update_cursor(target.id, increment_comments=newly_inserted)
+            await session.commit()
+
+            processor = MicroBatchProcessor()
+            total_evaluated, _ = await processor.process_all_pending(
+                session=session,
                 target_id=target.id,
-                author_id=author.id,
-                parent_external_id=norm_comment.parent_external_id,
-                source_name=norm_comment.source_name,
-                post_url=norm_comment.post_url,
-                comment_url=norm_comment.comment_url,
-                published_at=norm_comment.published_at,
-                child_comment_count=norm_comment.child_comment_count,
+                max_batches=25,
             )
-            if comment:
-                newly_inserted += 1
 
-        await t_repo.update_cursor(target.id, increment_comments=newly_inserted)
-        await session.commit()
+            threshold = settings.LLM_ALERT_SEVERITY_THRESHOLD
+            rows_stmt = (
+                select(Comment, PlatformAuthor)
+                .outerjoin(PlatformAuthor, Comment.author_id == PlatformAuthor.id)
+                .where(Comment.target_id == target.id)
+                .order_by(desc(Comment.published_at), desc(Comment.ingested_at))
+                .limit(limit)
+            )
+            rows = (await session.execute(rows_stmt)).all()
+            formatted_replies = [_format_comment(c, a, max_text=180, threshold=threshold) for c, a in rows]
+            flagged_replies = [r for r in formatted_replies if r.get("flagged")]
+            noise_skipped = sum(1 for r in formatted_replies if r.get("status") == "skipped_prefilter")
+            evaluated_count = sum(1 for r in formatted_replies if r.get("status") == "evaluated")
 
-        processor = MicroBatchProcessor()
-        total_evaluated, _ = await processor.process_all_pending(
-            session=session,
-            target_id=target.id,
-            max_batches=25,
+        return web.json_response(
+            {
+                "profile": profile_meta,
+                "stats": {
+                    "total_replies": len(formatted_replies),
+                    "newly_ingested": newly_inserted,
+                    "evaluated": evaluated_count,
+                    "noise_skipped": noise_skipped,
+                    "flagged_count": len(flagged_replies),
+                },
+                "flagged_replies": flagged_replies[:12],
+                "replies": formatted_replies[: min(limit, 20)],
+            }
         )
-
-        threshold = settings.LLM_ALERT_SEVERITY_THRESHOLD
-        rows_stmt = (
-            select(Comment, PlatformAuthor)
-            .outerjoin(PlatformAuthor, Comment.author_id == PlatformAuthor.id)
-            .where(Comment.target_id == target.id)
-            .order_by(desc(Comment.published_at), desc(Comment.ingested_at))
-            .limit(limit)
+    except ScraperError as s_err:
+        logger.warning(
+            "ScraperError in handle_replies",
+            error_code=s_err.error_code,
+            message=s_err.message,
+            status_code=s_err.status_code,
+            platform="x",
         )
-        rows = (await session.execute(rows_stmt)).all()
-        formatted_replies = [_format_comment(c, a, max_text=180, threshold=threshold) for c, a in rows]
-        flagged_replies = [r for r in formatted_replies if r.get("flagged")]
-        noise_skipped = sum(1 for r in formatted_replies if r.get("status") == "skipped_prefilter")
-        evaluated_count = sum(1 for r in formatted_replies if r.get("status") == "evaluated")
-
-    return web.json_response(
-        {
-            "profile": profile_meta,
-            "stats": {
-                "total_replies": len(formatted_replies),
-                "newly_ingested": newly_inserted,
-                "evaluated": evaluated_count,
-                "noise_skipped": noise_skipped,
-                "flagged_count": len(flagged_replies),
+        return web.json_response(
+            {"error": s_err.error_code, "message": s_err.message, "platform": "x"},
+            status=s_err.status_code,
+        )
+    except Exception as unhandled_err:
+        logger.exception("Unhandled error in handle_replies", error=str(unhandled_err), exc_info=True)
+        return web.json_response(
+            {
+                "error": "server_error",
+                "message": f"Replies endpoint encountered an unexpected error: {unhandled_err}",
+                "platform": "x",
             },
-            "flagged_replies": flagged_replies[:12],
-            "replies": formatted_replies[: min(limit, 20)],
-        }
-    )
+            status=500,
+        )
 
 
 def create_bridge_app(mtproto: Optional[Any] = None) -> web.Application:

@@ -168,26 +168,39 @@ def _patch_twikit_transaction() -> None:
         pass
 
 
+def _unwrap_user_result(user_res: Any) -> Dict[str, Any]:
+    """Unwrap nested user results such as UserWithVisibilityResults, user, or result.user."""
+    if not isinstance(user_res, dict):
+        return {}
+    if user_res.get("user") and isinstance(user_res["user"], dict):
+        return _unwrap_user_result(user_res["user"])
+    if user_res.get("result") and isinstance(user_res["result"], dict):
+        return _unwrap_user_result(user_res["result"])
+    return user_res
+
+
 def _patch_twikit_user() -> None:
-    """Ensure twikit's User.__init__ never crashes on missing Twitter user fields."""
+    """Ensure twikit's User.__init__ never crashes on UserWithVisibilityResults or missing fields."""
     try:
         from twikit.user import User
 
-        if getattr(User, "_ops_patched", False):
+        if getattr(User, "_ops_patched_v2", False):
             return
 
         orig_init = User.__init__
 
         def _safe_user_init(self, client, data):
+            unwrapped = _unwrap_user_result(data)
             try:
-                orig_init(self, client, data)
+                orig_init(self, client, unwrapped)
             except (KeyError, TypeError):
                 self._client = client
-                legacy = data.get("legacy") or {}
-                self.id = str(data.get("rest_id") or "")
+                raw_u = unwrapped
+                legacy = raw_u.get("legacy") or raw_u.get("core") or {}
+                self.id = str(raw_u.get("rest_id") or raw_u.get("id") or legacy.get("id_str") or "")
                 self.created_at = legacy.get("created_at") or ""
-                self.name = legacy.get("name") or ""
-                self.screen_name = legacy.get("screen_name") or ""
+                self.name = legacy.get("name") or raw_u.get("name") or ""
+                self.screen_name = legacy.get("screen_name") or raw_u.get("screen_name") or ""
                 self.profile_image_url = legacy.get("profile_image_url_https") or ""
                 self.profile_banner_url = legacy.get("profile_banner_url")
                 self.url = legacy.get("url")
@@ -197,7 +210,7 @@ def _patch_twikit_user() -> None:
                 self.description_urls = (ent.get("description") or {}).get("urls") or []
                 self.urls = (ent.get("url") or {}).get("urls")
                 self.pinned_tweet_ids = legacy.get("pinned_tweet_ids_str") or []
-                self.is_blue_verified = bool(data.get("is_blue_verified", False))
+                self.is_blue_verified = bool(raw_u.get("is_blue_verified", False) or (isinstance(data, dict) and data.get("is_blue_verified", False)))
                 self.verified = bool(legacy.get("verified", False))
                 self.possibly_sensitive = bool(legacy.get("possibly_sensitive", False))
                 self.can_dm = bool(legacy.get("can_dm", False))
@@ -221,6 +234,7 @@ def _patch_twikit_user() -> None:
 
         User.__init__ = _safe_user_init
         User._ops_patched = True
+        User._ops_patched_v2 = True
     except Exception:
         pass
 
@@ -1046,15 +1060,16 @@ class TwitterXCollector(BaseCollector):
 
     def _parse_user_by_screen_name_payload(self, data: Dict[str, Any], clean_username: str) -> Tuple[Optional[str], Dict[str, Any]]:
         """Safely extract user rest_id and profile metadata from UserByScreenName JSON without KeyError."""
-        user_res = ((data.get("data") or {}).get("user") or {}).get("result") or {}
-        if not user_res:
+        raw_user_res = ((data.get("data") or {}).get("user") or {}).get("result") or (data.get("data") or {}).get("user") or {}
+        if not raw_user_res:
             return None, {}
-        if user_res.get("__typename") == "UserUnavailable":
+        if raw_user_res.get("__typename") == "UserUnavailable":
             raise ScraperError("profile not found", f"X user @{clean_username} is unavailable or suspended", status_code=404)
 
-        legacy = user_res.get("legacy") or {}
+        user_res = _unwrap_user_result(raw_user_res)
+        legacy = user_res.get("legacy") or user_res.get("core") or {}
         core = user_res.get("core") or {}
-        rest_id = str(user_res.get("rest_id") or legacy.get("id_str") or "")
+        rest_id = str(user_res.get("rest_id") or user_res.get("id") or legacy.get("id_str") or "")
         if not rest_id:
             return None, {}
 
@@ -1083,7 +1098,8 @@ class TwitterXCollector(BaseCollector):
         count: int,
     ) -> List[Dict[str, Any]]:
         """Safely extract user timeline tweets from UserTweets GraphQL JSON."""
-        user_res = ((data.get("data") or {}).get("user") or {}).get("result") or {}
+        raw_user_res = ((data.get("data") or {}).get("user") or {}).get("result") or (data.get("data") or {}).get("user") or {}
+        user_res = _unwrap_user_result(raw_user_res)
         tl_v2 = (user_res.get("timeline_v2") or user_res.get("timeline") or {}).get("timeline") or {}
         instructions = tl_v2.get("instructions") or []
 
@@ -1625,10 +1641,11 @@ class TwitterXCollector(BaseCollector):
                     if not tw_id or tw_id in seen_ids:
                         continue
 
-                    u_res = ((tr.get("core") or {}).get("user_results") or {}).get("result") or {}
+                    u_raw = ((tr.get("core") or {}).get("user_results") or {}).get("result") or {}
+                    u_res = _unwrap_user_result(u_raw)
                     u_leg = u_res.get("legacy") or {}
                     u_core = u_res.get("core") or {}
-                    author_rest_id = str(u_res.get("rest_id") or "")
+                    author_rest_id = str(u_res.get("rest_id") or u_leg.get("id_str") or "")
                     author_screen_name = (u_leg.get("screen_name") or u_core.get("screen_name") or "").lstrip("@")
 
                     # Filter to only tweets/replies authored by the target user
@@ -1817,91 +1834,93 @@ class TwitterXCollector(BaseCollector):
                             }
                         )
 
-                if user_id:
-                    # 1. Primary: twikit client.get_user_tweets with TweetType.Replies enum
-                    try:
-                        tw_replies = await tw_client.get_user_tweets(
-                            user_id,
-                            tweet_type=TweetType.Replies,
-                            count=max(40, count * 2),
-                        )
-                        seen_tw = set()
-                        for item in tw_replies or []:
-                            candidates = [item] + list(getattr(item, "replies", None) or [])
-                            for tw in candidates:
-                                tw_id = str(getattr(tw, "id", "") or "")
-                                if not tw_id or tw_id in seen_tw:
-                                    continue
+                if not user_id:
+                    raise ScraperError("profile not found", f"Could not find X user @{clean_username}", status_code=404)
 
-                                # Filter for actual replies: in_reply_to_status_id_str is non-null
-                                in_reply_to_id = getattr(tw, "in_reply_to", None) or (
-                                    getattr(tw, "_legacy", {}).get("in_reply_to_status_id_str")
-                                    if hasattr(tw, "_legacy")
-                                    else None
-                                )
-                                if not in_reply_to_id:
-                                    continue
+                # 1. Primary: twikit client.get_user_tweets with TweetType.Replies enum
+                try:
+                    tw_replies = await tw_client.get_user_tweets(
+                        user_id,
+                        tweet_type=TweetType.Replies,
+                        count=max(40, count * 2),
+                    )
+                    seen_tw = set()
+                    for item in tw_replies or []:
+                        candidates = [item] + list(getattr(item, "replies", None) or [])
+                        for tw in candidates:
+                            tw_id = str(getattr(tw, "id", "") or "")
+                            if not tw_id or tw_id in seen_tw:
+                                continue
 
-                                tw_user = getattr(tw, "user", None)
-                                tw_screen = (getattr(tw_user, "screen_name", "") or "").lstrip("@")
-                                author_id = str(
-                                    getattr(tw_user, "id", "")
-                                    or (getattr(tw, "_legacy", {}).get("user_id_str") if hasattr(tw, "_legacy") else "")
-                                    or ""
-                                )
-                                if author_id and user_id and author_id != str(user_id):
-                                    continue
-                                if tw_screen and tw_screen.lower() != clean_username.lower():
-                                    continue
+                            # Filter strictly on tweet.in_reply_to (truthy)
+                            in_reply_to = getattr(tw, "in_reply_to", None)
+                            if not in_reply_to:
+                                continue
 
-                                tw_text = (getattr(tw, "full_text", None) or getattr(tw, "text", "") or "").strip()
-                                if not tw_text:
-                                    continue
+                            tw_user = getattr(tw, "user", None)
+                            tw_screen = (getattr(tw_user, "screen_name", "") or "").lstrip("@")
+                            if not tw_screen and hasattr(tw, "_legacy"):
+                                tw_screen = (tw._legacy.get("screen_name") or "").lstrip("@")
 
-                                seen_tw.add(tw_id)
-                                pub_dt = _parse_x_created_at(getattr(tw, "created_at", None))
-                                in_rep = str(in_reply_to_id)
-                                in_rep_user = (
-                                    getattr(tw, "_legacy", {}).get("in_reply_to_screen_name")
-                                    if hasattr(tw, "_legacy")
-                                    else None
+                            if tw_screen and tw_screen.lower() != clean_username.lower():
+                                continue
+
+                            author_id = str(
+                                getattr(tw_user, "id", "")
+                                or (getattr(tw, "_legacy", {}).get("user_id_str") if hasattr(tw, "_legacy") else "")
+                                or ""
+                            )
+                            if author_id and user_id and author_id != str(user_id):
+                                continue
+
+                            tw_text = (getattr(tw, "full_text", None) or getattr(tw, "text", "") or "").strip()
+                            if not tw_text:
+                                continue
+
+                            seen_tw.add(tw_id)
+                            pub_dt = _parse_x_created_at(getattr(tw, "created_at", None))
+                            in_rep = str(in_reply_to)
+                            in_rep_user = (
+                                getattr(tw, "_legacy", {}).get("in_reply_to_screen_name")
+                                if hasattr(tw, "_legacy")
+                                else None
+                            )
+                            source_name = (
+                                f"X Reply by @{clean_username} to @{in_rep_user}"
+                                if in_rep_user
+                                else f"X Reply by @{clean_username}"
+                            )
+                            collected.append(
+                                NormalizedComment(
+                                    platform="x",
+                                    external_comment_id=f"x_{tw_id}",
+                                    parent_external_id=in_rep,
+                                    target_external_id=f"@{clean_username}",
+                                    source_name=source_name,
+                                    post_url=(
+                                        f"https://x.com/{in_rep_user}/status/{in_rep}"
+                                        if in_rep_user
+                                        else f"https://x.com/i/status/{in_rep}"
+                                    ),
+                                    comment_url=f"https://x.com/{clean_username}/status/{tw_id}",
+                                    author_external_id=user_id,
+                                    author_username=clean_username,
+                                    author_display_name=profile_meta.get("full_name") or clean_username,
+                                    content_text=tw_text,
+                                    published_at=pub_dt,
+                                    child_comment_count=int(getattr(tw, "reply_count", 0) or 0),
                                 )
-                                source_name = (
-                                    f"X Reply by @{clean_username} to @{in_rep_user}"
-                                    if in_rep_user
-                                    else f"X Reply by @{clean_username}"
-                                )
-                                collected.append(
-                                    NormalizedComment(
-                                        platform="x",
-                                        external_comment_id=f"x_{tw_id}",
-                                        parent_external_id=in_rep,
-                                        target_external_id=f"@{clean_username}",
-                                        source_name=source_name,
-                                        post_url=(
-                                            f"https://x.com/{in_rep_user}/status/{in_rep}"
-                                            if in_rep_user
-                                            else f"https://x.com/i/status/{in_rep}"
-                                        ),
-                                        comment_url=f"https://x.com/{clean_username}/status/{tw_id}",
-                                        author_external_id=user_id,
-                                        author_username=clean_username,
-                                        author_display_name=profile_meta.get("full_name") or clean_username,
-                                        content_text=tw_text,
-                                        published_at=pub_dt,
-                                        child_comment_count=int(getattr(tw, "reply_count", 0) or 0),
-                                    )
-                                )
-                                if len(collected) >= count:
-                                    break
+                            )
                             if len(collected) >= count:
                                 break
-                    except (Unauthorized, Forbidden, AccountLocked, AccountSuspended) as auth_err:
-                        raise ScraperError("x session rejected", f"X session rejected: {auth_err}", status_code=401)
-                    except TooManyRequests as rl_err:
-                        raise ScraperError("rate limited", f"X rate limited: {rl_err}", status_code=429)
-                    except Exception as gut_err:
-                        logger.debug("twikit client.get_user_tweets(TweetType.Replies) fallback", error=str(gut_err))
+                        if len(collected) >= count:
+                            break
+                except (Unauthorized, Forbidden, AccountLocked, AccountSuspended) as auth_err:
+                    raise ScraperError("x session rejected", f"X session rejected: {auth_err}", status_code=401)
+                except TooManyRequests as rl_err:
+                    raise ScraperError("rate limited", f"X rate limited: {rl_err}", status_code=429)
+                except Exception as gut_err:
+                    logger.debug("twikit client.get_user_tweets(TweetType.Replies) fallback", error=str(gut_err))
 
                     # 2. Secondary: direct raw gql.user_tweets_and_replies
                     if not collected:

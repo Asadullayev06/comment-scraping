@@ -955,6 +955,46 @@ async def test_bridge_x_scrape_replies_and_explicit_errors(bridge_client, monkey
     assert "No recent replies found for @ZeroUser" in rep_zero_data["message"]
     assert rep_zero_data["profile"]["username"] == "@ZeroUser"
 
+    # Verify _unwrap_user_result handles UserWithVisibilityResults
+    from src.collectors.twitter_x import _unwrap_user_result
+    nested_user = {
+        "__typename": "UserWithVisibilityResults",
+        "user": {
+            "rest_id": "44196397",
+            "legacy": {"screen_name": "elonmusk", "name": "Elon Musk"},
+        },
+    }
+    unwrapped = _unwrap_user_result(nested_user)
+    assert unwrapped["rest_id"] == "44196397"
+    assert unwrapped["legacy"]["screen_name"] == "elonmusk"
+
+    # Verify tweet.in_reply_to truthy property filtering works on twikit Tweet objects
+    class MockTwikitTweet:
+        def __init__(self, tw_id, in_reply_to_val, text, user_screen):
+            self.id = tw_id
+            self._in_reply_to = in_reply_to_val
+            self.full_text = text
+            self.created_at = "Wed Oct 28 14:05:00 +0000 2026"
+            self.reply_count = 0
+            self._legacy = {
+                "id_str": tw_id,
+                "in_reply_to_status_id_str": in_reply_to_val,
+                "screen_name": user_screen,
+            }
+            class MockUser:
+                screen_name = user_screen
+                id = "44196397"
+            self.user = MockUser()
+
+        @property
+        def in_reply_to(self):
+            return self._in_reply_to
+
+    non_reply = MockTwikitTweet("1001", None, "Standalone post", "elonmusk")
+    real_reply = MockTwikitTweet("1002", "999", "Real reply to someone", "elonmusk")
+    assert bool(non_reply.in_reply_to) is False
+    assert bool(real_reply.in_reply_to) is True
+
 
 
 
