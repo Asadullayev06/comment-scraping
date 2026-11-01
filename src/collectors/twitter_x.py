@@ -146,24 +146,49 @@ except Exception:
 
 
 def _patch_twikit_transaction() -> None:
-    """Ensure twikit's ClientTransaction.init never crashes if X updates its ondemand.s script layout."""
+    """Ensure twikit's ClientTransaction uses the two-step chunk lookup for modern X ondemand.s script layout."""
     try:
+        import re
+        from twikit.x_client_transaction import transaction as tx_mod
         from twikit.x_client_transaction import ClientTransaction
 
-        if getattr(ClientTransaction, "_ops_patched", False):
+        if getattr(ClientTransaction, "_ops_patched_chunk2", False):
             return
 
-        orig_get_indices = ClientTransaction.get_indices
+        # Ensure the two-step regexes exist on the module
+        if not hasattr(tx_mod, "ON_DEMAND_FILE_REGEX"):
+            tx_mod.ON_DEMAND_FILE_REGEX = re.compile(r",(\d+):[\"']ondemand\.s[\"']")
+            tx_mod.ON_DEMAND_HASH_PATTERN = r',{{}}:"([0-9a-f]+)"'
 
-        async def _safe_get_indices(self, home_page_response, session, headers):
-            try:
-                return await orig_get_indices(self, home_page_response, session, headers)
-            except Exception:
-                # Fallback to standard key byte indices so ClientTransaction can still generate transaction IDs
-                return 2, [12, 14, 7]
+        async def _patched_get_indices(self, home_page_response, session, headers):
+            key_byte_indices = []
+            response = self.validate_response(home_page_response) or self.home_page_response
+            body = str(response)
+            idx_match = tx_mod.ON_DEMAND_FILE_REGEX.search(body)
+            if idx_match:
+                chunk_idx = idx_match.group(1)
+                hash_regex = re.compile(tx_mod.ON_DEMAND_HASH_PATTERN.format(chunk_idx))
+                hash_match = hash_regex.search(body)
+                if hash_match:
+                    on_demand_file_url = (
+                        "https://abs.twimg.com/responsive-web/client-web/"
+                        f"ondemand.s.{hash_match.group(1)}a.js"
+                    )
+                    on_demand_file_response = await session.request(
+                        method="GET", url=on_demand_file_url, headers=headers
+                    )
+                    key_byte_indices_match = tx_mod.INDICES_REGEX.finditer(
+                        str(on_demand_file_response.text)
+                    )
+                    for item in key_byte_indices_match:
+                        key_byte_indices.append(item.group(2))
+            if not key_byte_indices:
+                raise Exception("Couldn't get KEY_BYTE indices from X ondemand.s script")
+            key_byte_indices = list(map(int, key_byte_indices))
+            return key_byte_indices[0], key_byte_indices[1:]
 
-        ClientTransaction.get_indices = _safe_get_indices
-        ClientTransaction._ops_patched = True
+        ClientTransaction.get_indices = _patched_get_indices
+        ClientTransaction._ops_patched_chunk2 = True
     except Exception:
         pass
 
@@ -1837,84 +1862,102 @@ class TwitterXCollector(BaseCollector):
                 if not user_id:
                     raise ScraperError("profile not found", f"Could not find X user @{clean_username}", status_code=404)
 
-                # 1. Primary: twikit client.get_user_tweets with TweetType.Replies enum
+                # 1. Primary: twikit client.get_user_tweets with TweetType.Replies enum and pagination
                 try:
                     tw_replies = await tw_client.get_user_tweets(
                         user_id,
                         tweet_type=TweetType.Replies,
-                        count=max(40, count * 2),
+                        count=40,
                     )
                     seen_tw = set()
-                    for item in tw_replies or []:
-                        candidates = [item] + list(getattr(item, "replies", None) or [])
-                        for tw in candidates:
-                            tw_id = str(getattr(tw, "id", "") or "")
-                            if not tw_id or tw_id in seen_tw:
-                                continue
+                    page = 0
+                    max_pages = 10
 
-                            # Filter strictly on tweet.in_reply_to (truthy)
-                            in_reply_to = getattr(tw, "in_reply_to", None)
-                            if not in_reply_to:
-                                continue
+                    while tw_replies and page < max_pages:
+                        page += 1
+                        for item in tw_replies:
+                            candidates = [item] + list(getattr(item, "replies", None) or [])
+                            for tw in candidates:
+                                tw_id = str(getattr(tw, "id", "") or "")
+                                if not tw_id or tw_id in seen_tw:
+                                    continue
 
-                            tw_user = getattr(tw, "user", None)
-                            tw_screen = (getattr(tw_user, "screen_name", "") or "").lstrip("@")
-                            if not tw_screen and hasattr(tw, "_legacy"):
-                                tw_screen = (tw._legacy.get("screen_name") or "").lstrip("@")
+                                # Filter strictly on tweet.in_reply_to (truthy)
+                                in_reply_to = getattr(tw, "in_reply_to", None)
+                                if not in_reply_to:
+                                    continue
 
-                            if tw_screen and tw_screen.lower() != clean_username.lower():
-                                continue
+                                tw_user = getattr(tw, "user", None)
+                                tw_screen = (getattr(tw_user, "screen_name", "") or "").lstrip("@")
+                                if not tw_screen and hasattr(tw, "_legacy"):
+                                    tw_screen = (tw._legacy.get("screen_name") or "").lstrip("@")
 
-                            author_id = str(
-                                getattr(tw_user, "id", "")
-                                or (getattr(tw, "_legacy", {}).get("user_id_str") if hasattr(tw, "_legacy") else "")
-                                or ""
-                            )
-                            if author_id and user_id and author_id != str(user_id):
-                                continue
+                                if tw_screen and tw_screen.lower() != clean_username.lower():
+                                    continue
 
-                            tw_text = (getattr(tw, "full_text", None) or getattr(tw, "text", "") or "").strip()
-                            if not tw_text:
-                                continue
-
-                            seen_tw.add(tw_id)
-                            pub_dt = _parse_x_created_at(getattr(tw, "created_at", None))
-                            in_rep = str(in_reply_to)
-                            in_rep_user = (
-                                getattr(tw, "_legacy", {}).get("in_reply_to_screen_name")
-                                if hasattr(tw, "_legacy")
-                                else None
-                            )
-                            source_name = (
-                                f"X Reply by @{clean_username} to @{in_rep_user}"
-                                if in_rep_user
-                                else f"X Reply by @{clean_username}"
-                            )
-                            collected.append(
-                                NormalizedComment(
-                                    platform="x",
-                                    external_comment_id=f"x_{tw_id}",
-                                    parent_external_id=in_rep,
-                                    target_external_id=f"@{clean_username}",
-                                    source_name=source_name,
-                                    post_url=(
-                                        f"https://x.com/{in_rep_user}/status/{in_rep}"
-                                        if in_rep_user
-                                        else f"https://x.com/i/status/{in_rep}"
-                                    ),
-                                    comment_url=f"https://x.com/{clean_username}/status/{tw_id}",
-                                    author_external_id=user_id,
-                                    author_username=clean_username,
-                                    author_display_name=profile_meta.get("full_name") or clean_username,
-                                    content_text=tw_text,
-                                    published_at=pub_dt,
-                                    child_comment_count=int(getattr(tw, "reply_count", 0) or 0),
+                                author_id = str(
+                                    getattr(tw_user, "id", "")
+                                    or (getattr(tw, "_legacy", {}).get("user_id_str") if hasattr(tw, "_legacy") else "")
+                                    or ""
                                 )
-                            )
+                                if author_id and user_id and author_id != str(user_id):
+                                    continue
+
+                                tw_text = (getattr(tw, "full_text", None) or getattr(tw, "text", "") or "").strip()
+                                if not tw_text:
+                                    continue
+
+                                seen_tw.add(tw_id)
+                                pub_dt = _parse_x_created_at(getattr(tw, "created_at", None))
+                                in_rep = str(in_reply_to)
+                                in_rep_user = (
+                                    getattr(tw, "_legacy", {}).get("in_reply_to_screen_name")
+                                    if hasattr(tw, "_legacy")
+                                    else None
+                                )
+                                source_name = (
+                                    f"X Reply by @{clean_username} to @{in_rep_user}"
+                                    if in_rep_user
+                                    else f"X Reply by @{clean_username}"
+                                )
+                                collected.append(
+                                    NormalizedComment(
+                                        platform="x",
+                                        external_comment_id=f"x_{tw_id}",
+                                        parent_external_id=in_rep,
+                                        target_external_id=f"@{clean_username}",
+                                        source_name=source_name,
+                                        post_url=(
+                                            f"https://x.com/{in_rep_user}/status/{in_rep}"
+                                            if in_rep_user
+                                            else f"https://x.com/i/status/{in_rep}"
+                                        ),
+                                        comment_url=f"https://x.com/{clean_username}/status/{tw_id}",
+                                        author_external_id=author_id or user_id or clean_username,
+                                        author_username=clean_username,
+                                        author_display_name=profile_meta.get("full_name") or clean_username,
+                                        content_text=tw_text,
+                                        published_at=pub_dt,
+                                        child_comment_count=int(getattr(tw, "reply_count", 0) or 0),
+                                    )
+                                )
+                                if len(collected) >= count:
+                                    break
                             if len(collected) >= count:
                                 break
-                        if len(collected) >= count:
+
+                        if len(collected) >= count or not hasattr(tw_replies, "next"):
                             break
+
+                        try:
+                            next_page = await tw_replies.next()
+                            if not next_page or len(next_page) == 0:
+                                break
+                            tw_replies = next_page
+                        except Exception as next_err:
+                            logger.debug("twikit pagination reached end or error", page=page, error=str(next_err))
+                            break
+
                 except (Unauthorized, Forbidden, AccountLocked, AccountSuspended) as auth_err:
                     raise ScraperError("x session rejected", f"X session rejected: {auth_err}", status_code=401)
                 except TooManyRequests as rl_err:
