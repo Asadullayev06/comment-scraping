@@ -25,9 +25,8 @@ COPY pyproject.toml README.md ./
 # Install python dependencies into system environment
 RUN uv pip install --system -e .
 
-# Install Playwright browser dependencies (for headless social scraping)
-RUN playwright install chromium
-RUN playwright install-deps chromium
+# Install Playwright browser and its OS system dependencies
+RUN playwright install --with-deps chromium
 
 # Copy application source
 COPY src/ /app/src/

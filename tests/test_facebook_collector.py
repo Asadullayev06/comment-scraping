@@ -333,3 +333,38 @@ async def test_facebook_collector_fetch_comments_mocked(monkeypatch):
     assert comments[0].external_comment_id == "fb_10001"
     assert comments[0].content_text == "Fikr bildirish uchun juda yaxshi post."
     assert comments[0].author_display_name == "Test Foydalanuvchi"
+
+
+@pytest.mark.asyncio
+async def test_facebook_profile_numeric_id_and_login_error_surfaces_playwright(monkeypatch):
+    from src.collectors.base import ScraperError
+
+    collector = FacebookCollector()
+
+    class FakeResponse:
+        status_code = 200
+        text = '<html><head><meta property="og:title" content="Facebook"></head><body></body></html>'
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, *args, **kwargs):
+            assert "profile.php?id=61592582919537" in str(url)
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", FakeClient)
+
+    # When Playwright cannot extract posts, it should raise 401 ScraperError and surface any Playwright fallback detail
+    with pytest.raises(ScraperError) as exc_info:
+        await collector.fetch_profile_info_and_posts("https://www.facebook.com/profile.php?id=61592582919537")
+
+    assert exc_info.value.status_code == 401
+    assert "requires login or active burner session" in str(exc_info.value.message)
+

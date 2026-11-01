@@ -1010,8 +1010,22 @@ async def test_bridge_facebook_profile_and_scrape(bridge_client, monkeypatch):
     # Test _extract_facebook_profile_username
     assert _extract_facebook_profile_username("https://www.facebook.com/zuck") == "zuck"
     assert _extract_facebook_profile_username("https://www.facebook.com/profile.php?id=4") == "4"
+    assert _extract_facebook_profile_username("https://www.facebook.com/profile.php?id=61592582919537") == "61592582919537"
     assert _extract_facebook_profile_username("@zuck", explicit_platform="facebook") == "zuck"
     assert _extract_facebook_profile_username("https://www.facebook.com/zuck/posts/10114294029482931") is None
+    assert _extract_facebook_profile_username("https://www.facebook.com/122124655497419430") is None
+
+    # Test detect_platform_and_id for Facebook post ID routing
+    from src.bot.handlers.targets import detect_platform_and_id
+    plat, ttype, ext_id, _ = detect_platform_and_id("https://www.facebook.com/122124655497419430")
+    assert plat == "facebook"
+    assert ttype == "post_url"
+    assert ext_id == "122124655497419430"
+
+    plat2, ttype2, ext_id2, _ = detect_platform_and_id("https://www.facebook.com/profile.php?id=61592582919537")
+    assert plat2 == "facebook"
+    assert ttype2 == "profile"
+    assert ext_id2 == "61592582919537"
 
     # Register healthy Facebook session in test DB
     async with bridge_mod.async_session_factory() as session:

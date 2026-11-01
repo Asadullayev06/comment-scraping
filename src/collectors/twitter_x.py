@@ -852,7 +852,11 @@ class TwitterXCollector(BaseCollector):
         proxy_cfg = {"server": proxy_url} if proxy_url else None
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, proxy=proxy_cfg)
+            browser = await p.chromium.launch(
+                headless=True,
+                proxy=proxy_cfg,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
             try:
                 context = await browser.new_context(user_agent=user_agent)
                 await context.add_cookies(pw_cookies)
@@ -1494,7 +1498,11 @@ class TwitterXCollector(BaseCollector):
                                 )
                         proxy_cfg = {"server": proxy_url} if proxy_url else None
                         async with async_playwright() as p:
-                            browser = await p.chromium.launch(headless=True, proxy=proxy_cfg)
+                            browser = await p.chromium.launch(
+                                headless=True,
+                                proxy=proxy_cfg,
+                                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+                            )
                             try:
                                 context = await browser.new_context(user_agent=user_agent)
                                 await context.add_cookies(pw_cookies)

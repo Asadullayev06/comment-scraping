@@ -81,6 +81,7 @@ def detect_platform_and_id(input_str: str) -> Tuple[Optional[str], Optional[str]
             or re.search(r"/reel/(\d+)", text)
             or re.search(r"fb\.watch/([A-Za-z0-9_.-]+)", text)
             or re.search(r"/share/[pvr]/([A-Za-z0-9_.-]+)", text)
+            or re.search(r"facebook\.com/(\d{10,})(?:[/?#]|$)", text)
         )
         if post_match:
             return platform, "post_url", post_match.group(1), text

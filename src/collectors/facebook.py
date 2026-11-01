@@ -361,11 +361,21 @@ class FacebookCollector(BaseCollector):
         count: int = 5,
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         """Fetch Facebook profile/page metadata and recent posts via HTTP and Playwright fallback."""
-        clean_handle = username_or_id.strip().lstrip("@").split("?")[0].strip("/")
-        if "facebook.com/" in clean_handle:
-            clean_handle = clean_handle.split("facebook.com/")[-1].split("/")[0].lstrip("@")
+        # Extract clean handle or numeric ID
+        raw = username_or_id.strip()
+        m_id = re.search(r"profile\.php\?id=(\d+)", raw)
+        if m_id:
+            clean_handle = m_id.group(1)
+            profile_url = f"https://www.facebook.com/profile.php?id={clean_handle}"
+        else:
+            clean_handle = raw.lstrip("@").split("?")[0].strip("/")
+            if "facebook.com/" in clean_handle:
+                clean_handle = clean_handle.split("facebook.com/")[-1].split("/")[0].lstrip("@")
+            if clean_handle.isdigit():
+                profile_url = f"https://www.facebook.com/profile.php?id={clean_handle}"
+            else:
+                profile_url = f"https://www.facebook.com/{clean_handle}/"
 
-        profile_url = f"https://www.facebook.com/{clean_handle}/"
         profile_meta = {
             "platform": "facebook",
             "username": f"@{clean_handle}",
@@ -434,6 +444,7 @@ class FacebookCollector(BaseCollector):
             logger.warning("Facebook profile direct HTTP fetch failed", handle=clean_handle, error=str(e))
 
         # Engine 2: Playwright fallback if direct HTTP found no posts
+        playwright_error: Optional[str] = None
         if not recent_posts:
             try:
                 from playwright.async_api import async_playwright
@@ -454,7 +465,11 @@ class FacebookCollector(BaseCollector):
 
                 proxy_cfg = {"server": proxy_url} if proxy_url else None
                 async with async_playwright() as p:
-                    browser = await p.chromium.launch(headless=True, proxy=proxy_cfg)
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        proxy=proxy_cfg,
+                        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+                    )
                     try:
                         context = await browser.new_context(user_agent=user_agent)
                         if pw_cookies:
@@ -510,6 +525,7 @@ class FacebookCollector(BaseCollector):
                     finally:
                         await browser.close()
             except Exception as pw_err:
+                playwright_error = str(pw_err)
                 logger.warning("Facebook profile Playwright fallback failed", handle=clean_handle, error=str(pw_err))
 
         # If shell page had og:title="Facebook", ensure full_name is null and verified is false
@@ -529,9 +545,12 @@ class FacebookCollector(BaseCollector):
                 and profile_meta.get("followers") is None
             )
         ) and not recent_posts:
+            err_msg = f"Facebook profile '@{clean_handle}' requires login or active burner session"
+            if playwright_error:
+                err_msg += f" (Playwright fallback error: {playwright_error})"
             raise ScraperError(
                 "facebook profile requires login",
-                f"Facebook profile '@{clean_handle}' requires login or active burner session",
+                err_msg,
                 status_code=401,
             )
 
@@ -583,7 +602,11 @@ class FacebookCollector(BaseCollector):
 
         proxy_cfg = {"server": proxy_url} if proxy_url else None
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, proxy=proxy_cfg)
+            browser = await p.chromium.launch(
+                headless=True,
+                proxy=proxy_cfg,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
             try:
                 context = await browser.new_context(user_agent=user_agent)
                 if pw_cookies:

@@ -213,6 +213,10 @@ def _extract_facebook_profile_username(raw_input: str, explicit_platform: str = 
         if m_page:
             return m_page.group(1)
 
+        # Reject bare numeric post/story IDs like facebook.com/122124655497419430
+        if re.search(r"facebook\.com/(\d{10,})(?:[/?#]|$)", text):
+            return None
+
         # Check slug: facebook.com/<slug>
         m_slug = re.search(r"facebook\.com/([A-Za-z0-9_.-]+)(?:[/?#]|$)", text)
         if m_slug:
@@ -228,6 +232,9 @@ def _extract_facebook_profile_username(raw_input: str, explicit_platform: str = 
 
     if explicit_platform == "facebook":
         candidate = text.lstrip("@").strip()
+        # Reject bare numeric strings of 10+ digits if not explicitly profile.php
+        if re.match(r"^\d{10,}$", candidate):
+            return None
         if re.match(r"^[A-Za-z0-9_.-]{2,50}$", candidate):
             return candidate
 
