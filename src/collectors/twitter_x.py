@@ -159,6 +159,8 @@ def _patch_twikit_transaction() -> None:
         if not hasattr(tx_mod, "ON_DEMAND_FILE_REGEX"):
             tx_mod.ON_DEMAND_FILE_REGEX = re.compile(r",(\d+):[\"']ondemand\.s[\"']")
             tx_mod.ON_DEMAND_HASH_PATTERN = r',{{}}:"([0-9a-f]+)"'
+        if not hasattr(tx_mod, "INDICES_REGEX"):
+            tx_mod.INDICES_REGEX = re.compile(r"(\(\w{1}\[(\d{1,2})\],\s*16\))+")
 
         async def _patched_get_indices(self, home_page_response, session, headers):
             key_byte_indices = []

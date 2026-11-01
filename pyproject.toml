@@ -22,7 +22,7 @@ dependencies = [
     "structlog>=24.1.0",
     "python-dotenv>=1.0.1",
     "instagrapi>=3.1.0",
-    "twikit @ git+https://github.com/unclecode/twikit.git",
+    "twikit>=2.2.0",
 ]
 
 [project.optional-dependencies]
