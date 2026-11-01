@@ -736,6 +736,7 @@ async def _fetch_facebook_profile_and_posts(
     """Fetch Facebook profile metadata and recent posts, supporting both full and monkeypatched collectors."""
     if getattr(FacebookCollector.fetch_profile_recent_posts, "__name__", "") != "fetch_profile_recent_posts":
         posts = await fb_collector.fetch_profile_recent_posts(username, count=count)
+        posts = posts[:count]
         meta = {
             "platform": "facebook",
             "username": f"@{username.lstrip('@')}",
@@ -745,6 +746,7 @@ async def _fetch_facebook_profile_and_posts(
             "followers": None,
             "following": None,
             "total_posts": len(posts),
+            "posts_returned": len(posts),
             "is_verified": False,
         }
         return meta, posts
@@ -752,6 +754,7 @@ async def _fetch_facebook_profile_and_posts(
     meta, posts = await fb_collector.fetch_profile_info_and_posts(username, count=count)
     if not posts:
         posts = await fb_collector.fetch_profile_recent_posts(username, count=count)
+    posts = posts[:count]
     meta["posts_returned"] = len(posts)
     return meta, posts
 
@@ -846,6 +849,7 @@ async def _execute_profile_analysis(
         return None, 404
 
     selected_posts = recent_posts[:posts_count]
+    profile_meta["posts_returned"] = len(selected_posts)
     target_ids: List[str] = []
     post_id_map: Dict[str, str] = {}
     total_newly_ingested = 0
@@ -902,7 +906,7 @@ async def _execute_profile_analysis(
                     "shortcode": sc,
                     "url": p["url"],
                     "published_at": p.get("published_at"),
-                    "ig_comment_count": p.get("comment_count", 0),
+                    "comment_count": p.get("comment_count") or c_total,
                     "like_count": p.get("like_count", 0),
                     "scraped_comments": c_total,
                     "evaluated": c_eval,
@@ -990,8 +994,13 @@ async def _execute_profile_analysis(
             limit=6,
         )
 
+    # Engagement aggregation: compute average comments from stored comment rows in DB
+    avg_comments = int(round(total_stored / max(1, len(selected_posts))))
+    if avg_comments == 0 and selected_posts:
+        avg_comments = int(sum(p.get("comment_count", 0) for p in selected_posts) / max(1, len(selected_posts)))
     avg_likes = int(sum(p.get("like_count", 0) for p in selected_posts) / max(1, len(selected_posts)))
-    avg_comments = int(sum(p.get("comment_count", 0) for p in selected_posts) / max(1, len(selected_posts)))
+
+    profile_meta["posts_returned"] = len(selected_posts)
 
     return (
         {

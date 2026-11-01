@@ -1118,6 +1118,17 @@ async def test_bridge_facebook_profile_and_scrape(bridge_client, monkeypatch):
     assert scrape_post_data["target"]["external_id"] == "10114294029482931"
     assert scrape_post_data["scrape_result"]["newly_ingested"] == 0
 
+    # 5. Test POST /api/profile with scrape=True and verify engagement aggregation computes from stored comments
+    prof_scrape_resp = await bridge_client.post(
+        "/api/profile",
+        json={"handle": "https://www.facebook.com/zuck", "posts": 1, "scrape": True},
+    )
+    assert prof_scrape_resp.status == 200
+    prof_scrape_data = await prof_scrape_resp.json()
+    assert prof_scrape_data["profile"]["posts_returned"] == 1
+    assert prof_scrape_data["cadence_and_engagement"]["avg_comments_per_post"] >= 1
+    assert prof_scrape_data["posts"][0]["comment_count"] >= 1
+
 
 
 

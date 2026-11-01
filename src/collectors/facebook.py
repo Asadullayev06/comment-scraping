@@ -100,25 +100,48 @@ def parse_profile_meta_from_html(html: str, username: str) -> Dict[str, Any]:
         "total_posts": None,
         "is_verified": False,
         "avatar_url": None,
+        "is_login_wall": False,
     }
 
     # Extract OpenGraph / Meta tags
+    raw_title = ""
     title_m = re.search(r'<meta property="og:title" content="([^"]+)"', html, re.IGNORECASE)
     if not title_m:
         title_m = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
     if title_m:
-        raw_title = title_m.group(1).replace("&#039;", "'").replace("&amp;", "&")
-        # Remove suffixes like " - Home | Facebook" or " | Facebook"
-        cleaned_title = re.sub(r"\s*[-|]\s*(?:Home\s*\|\s*)?Facebook.*$", "", raw_title, flags=re.IGNORECASE).strip()
-        if cleaned_title:
-            profile_meta["full_name"] = cleaned_title
+        raw_title = title_m.group(1).replace("&#039;", "'").replace("&amp;", "&").strip()
 
+    # Extract description / bio
+    raw_desc = ""
     desc_m = re.search(r'<meta property="og:description" content="([^"]+)"', html, re.IGNORECASE)
     if desc_m:
-        raw_desc = desc_m.group(1).replace("&#039;", "'").replace("&amp;", "&")
-        profile_meta["bio"] = " ".join(raw_desc.split())[:250]
+        raw_desc = desc_m.group(1).replace("&#039;", "'").replace("&amp;", "&").strip()
 
-        # Check for follower counts inside description (e.g. "119M likes · 119M followers")
+    # Check for login wall: og:title is "Facebook" or "Log In or Sign Up" with no bio or login prompt bio
+    lower_title = raw_title.lower()
+    cleaned_title = re.sub(r"\s*[-|]\s*(?:Home\s*\|\s*)?Facebook.*$", "", raw_title, flags=re.IGNORECASE).strip()
+
+    is_facebook_shell = (
+        lower_title in ("facebook", "log in or sign up to view", "log into facebook", "facebook – log in or sign up", "facebook - log in or sign up")
+        or cleaned_title.lower() in ("facebook", "log in or sign up to view", "log into facebook")
+        or "log into facebook" in lower_title
+    )
+    has_login_desc = (
+        not raw_desc
+        or "log into facebook" in raw_desc.lower()
+        or "log in or sign up" in raw_desc.lower()
+        or "connecting with your friends" in raw_desc.lower()
+    )
+
+    if is_facebook_shell and has_login_desc:
+        profile_meta["is_login_wall"] = True
+        return profile_meta
+
+    if cleaned_title and cleaned_title.lower() != "facebook":
+        profile_meta["full_name"] = cleaned_title
+
+    if raw_desc and not has_login_desc:
+        profile_meta["bio"] = " ".join(raw_desc.split())[:250]
         fol_m = re.search(r"([\d.,]+[KMBkmb]?)\s+followers", raw_desc, re.IGNORECASE)
         if fol_m:
             profile_meta["followers"] = parse_count_str(fol_m.group(1))
@@ -131,7 +154,15 @@ def parse_profile_meta_from_html(html: str, username: str) -> Dict[str, Any]:
     if img_m:
         profile_meta["avatar_url"] = img_m.group(1).replace("&amp;", "&")
 
-    if re.search(r'"is_verified":\s*true', html, re.IGNORECASE) or re.search(r'"verified":\s*true', html, re.IGNORECASE):
+    # Only set verified if profile is valid and verified badge/flag is present
+    if (
+        not profile_meta.get("is_login_wall")
+        and profile_meta.get("full_name")
+        and (
+            re.search(r'"(?:user|page|profile_owner|delegate_page)":\s*\{[^}]*"is_verified":\s*true', html, re.IGNORECASE)
+            or re.search(r'"is_verified":\s*true', html, re.IGNORECASE)
+        )
+    ):
         profile_meta["is_verified"] = True
 
     return profile_meta
@@ -200,17 +231,24 @@ def extract_comments_from_json(
 
 
 def extract_posts_from_json(data: Any, base_username: str = "") -> List[Dict[str, Any]]:
-    """Recursively search Relay / GraphQL JSON objects for user timeline posts."""
-    posts: List[Dict[str, Any]] = []
-    seen_urls = set()
+    """Search Relay / GraphQL JSON objects for user timeline posts with caption and timestamp read from the same node."""
+    posts_by_id: Dict[str, Dict[str, Any]] = {}
 
     def _walk(obj: Any):
         if isinstance(obj, dict):
-            # Story or timeline unit candidate
-            msg_obj = obj.get("message")
-            story_url = obj.get("url") or obj.get("share_url") or obj.get("story_url")
-            c_time = obj.get("creation_time") or obj.get("publish_time")
-            fbid = obj.get("legacy_fbid") or obj.get("post_id") or obj.get("id")
+            # Target the story node directly or inside comet_sections.content.story
+            story_node = obj
+            if "comet_sections" in obj and isinstance(obj["comet_sections"], dict):
+                content = obj["comet_sections"].get("content") or {}
+                if isinstance(content, dict) and isinstance(content.get("story"), dict):
+                    story_node = content["story"]
+            elif "story" in obj and isinstance(obj["story"], dict):
+                story_node = obj["story"]
+
+            msg_obj = story_node.get("message")
+            story_url = story_node.get("url") or story_node.get("share_url") or story_node.get("story_url")
+            c_time = story_node.get("creation_time") or story_node.get("publish_time")
+            fbid = story_node.get("post_id") or story_node.get("legacy_fbid") or story_node.get("id")
 
             caption = ""
             if isinstance(msg_obj, dict):
@@ -218,45 +256,60 @@ def extract_posts_from_json(data: Any, base_username: str = "") -> List[Dict[str
             elif isinstance(msg_obj, str):
                 caption = msg_obj
 
-            if (story_url or fbid) and (caption or c_time):
+            # Fallback to general text attribute if message is absent
+            if not caption:
+                raw_text = story_node.get("text")
+                if isinstance(raw_text, str) and len(raw_text.strip()) > 3:
+                    caption = raw_text.strip()
+
+            if story_url or fbid:
+                shortcode = str(fbid or "")
                 p_url = story_url or (f"https://www.facebook.com/{fbid}" if fbid else "")
-                if p_url and p_url not in seen_urls:
-                    # Clean post id / shortcode
-                    shortcode = str(fbid or "")
-                    if not shortcode and p_url:
-                        m = re.search(r"/posts/([A-Za-z0-9_.-]+)", p_url) or re.search(r"story_fbid=([A-Za-z0-9_.-]+)", p_url)
-                        shortcode = m.group(1) if m else p_url.split("/")[-1]
+                if not shortcode and p_url:
+                    m = re.search(r"/posts/([A-Za-z0-9_.-]+)", p_url) or re.search(r"story_fbid=([A-Za-z0-9_.-]+)", p_url)
+                    shortcode = m.group(1) if m else p_url.split("/")[-1]
 
-                    feedback = obj.get("feedback") or {}
-                    like_cnt = (
-                        feedback.get("reaction_count", {}).get("count")
-                        or feedback.get("reactors", {}).get("count")
-                        or 0
-                    )
-                    comm_cnt = (
-                        feedback.get("comments_count_summary", {}).get("total_count")
-                        or feedback.get("comments", {}).get("total_count")
-                        or 0
-                    )
+                post_key = shortcode or p_url
+                ts = int(c_time) if (c_time and isinstance(c_time, (int, float))) else 0
+                pub_dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts > 0 else None
 
-                    pub_dt = (
-                        datetime.fromtimestamp(c_time, tz=timezone.utc)
-                        if (c_time and isinstance(c_time, (int, float)))
-                        else None
-                    )
+                feedback = story_node.get("feedback") or {}
+                like_cnt = (
+                    feedback.get("reaction_count", {}).get("count")
+                    or feedback.get("reactors", {}).get("count")
+                    or 0
+                )
+                comm_cnt = (
+                    feedback.get("comments_count_summary", {}).get("total_count")
+                    or feedback.get("comments", {}).get("total_count")
+                    or 0
+                )
 
-                    seen_urls.add(p_url)
-                    posts.append(
-                        {
-                            "shortcode": shortcode,
-                            "url": p_url,
-                            "caption": " ".join(caption.split())[:160] if caption else "",
-                            "comment_count": int(comm_cnt or 0),
-                            "like_count": int(like_cnt or 0),
-                            "published_at": pub_dt.strftime("%Y-%m-%d %H:%M") if pub_dt else None,
-                            "timestamp": int(c_time) if c_time else 0,
-                        }
-                    )
+                if post_key:
+                    if post_key not in posts_by_id:
+                        if caption or ts:
+                            posts_by_id[post_key] = {
+                                "shortcode": shortcode,
+                                "url": p_url,
+                                "caption": " ".join(caption.split())[:160] if caption else "",
+                                "comment_count": int(comm_cnt or 0),
+                                "like_count": int(like_cnt or 0),
+                                "published_at": pub_dt.strftime("%Y-%m-%d %H:%M") if pub_dt else None,
+                                "timestamp": ts,
+                            }
+                    else:
+                        existing = posts_by_id[post_key]
+                        # Merge if new node has caption and existing had none
+                        if not existing.get("caption") and caption:
+                            existing["caption"] = " ".join(caption.split())[:160]
+                        # Merge if new node has timestamp and existing had none
+                        if not existing.get("timestamp") and ts:
+                            existing["timestamp"] = ts
+                            existing["published_at"] = pub_dt.strftime("%Y-%m-%d %H:%M") if pub_dt else None
+                        if comm_cnt:
+                            existing["comment_count"] = max(existing.get("comment_count", 0), int(comm_cnt))
+                        if like_cnt:
+                            existing["like_count"] = max(existing.get("like_count", 0), int(like_cnt))
 
             for v in obj.values():
                 _walk(v)
@@ -266,6 +319,7 @@ def extract_posts_from_json(data: Any, base_username: str = "") -> List[Dict[str
 
     _walk(data)
     # Sort posts newest first
+    posts = list(posts_by_id.values())
     posts.sort(key=lambda p: p.get("timestamp") or 0, reverse=True)
     return posts
 
@@ -342,6 +396,7 @@ class FacebookCollector(BaseCollector):
         headers["User-Agent"] = user_agent
 
         recent_posts: List[Dict[str, Any]] = []
+        is_shell_login_wall = False
 
         # Engine 1: Direct HTTP GET
         try:
@@ -351,12 +406,15 @@ class FacebookCollector(BaseCollector):
                 if resp.status_code == 200:
                     html_text = resp.text
                     meta = parse_profile_meta_from_html(html_text, clean_handle)
-                    profile_meta.update({k: v for k, v in meta.items() if v is not None})
+                    if meta.get("is_login_wall"):
+                        is_shell_login_wall = True
+                    else:
+                        profile_meta.update({k: v for k, v in meta.items() if v is not None and k != "is_login_wall"})
 
                     # Parse embedded scripts for posts
                     script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_text, flags=re.DOTALL)
                     for block in script_blocks:
-                        if "{" in block and ("timeline" in block or "story" in block or "feedback" in block):
+                        if "{" in block and ("timeline" in block or "story" in block or "feedback" in block or "message" in block):
                             try:
                                 json_matches = re.findall(r'(\{(?:[^{}]|(?R))*\})', block)
                             except Exception:
@@ -370,6 +428,8 @@ class FacebookCollector(BaseCollector):
                                             recent_posts.append(p)
                                 except Exception:
                                     continue
+                elif resp.status_code in (401, 403):
+                    is_shell_login_wall = True
         except Exception as e:
             logger.warning("Facebook profile direct HTTP fetch failed", handle=clean_handle, error=str(e))
 
@@ -452,11 +512,27 @@ class FacebookCollector(BaseCollector):
             except Exception as pw_err:
                 logger.warning("Facebook profile Playwright fallback failed", handle=clean_handle, error=str(pw_err))
 
+        # Check login wall: if og:title was Facebook with no bio, or metadata failed to resolve
+        if is_shell_login_wall or (
+            profile_meta.get("full_name") in (None, "Facebook")
+            and profile_meta.get("bio") is None
+            and profile_meta.get("followers") is None
+        ):
+            raise ScraperError(
+                "facebook profile requires login",
+                f"Facebook profile '@{clean_handle}' requires login or active burner session",
+                status_code=401,
+            )
+
+        recent_posts = recent_posts[:count]
         # Add 1-based post_index
         for idx, p in enumerate(recent_posts):
             p["post_index"] = idx + 1
 
-        return profile_meta, recent_posts[:count]
+        profile_meta["total_posts"] = len(recent_posts)
+        profile_meta["posts_returned"] = len(recent_posts)
+
+        return profile_meta, recent_posts
 
     async def fetch_profile_recent_posts(
         self,

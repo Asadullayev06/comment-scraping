@@ -50,7 +50,7 @@ def test_parse_profile_meta_from_html():
     <meta property="og:title" content="Mark Zuckerberg - Home | Facebook">
     <meta property="og:description" content="Mark Zuckerberg. 119M likes · 119M followers. Founder and CEO at Meta. Building AI and the metaverse.">
     <meta property="og:image" content="https://scontent.xx.fbcdn.net/v/avatar.jpg?stp=cp0&amp;oh=123">
-    <script>{"is_verified": true}</script>
+    <script>{"user": {"is_verified": true}}</script>
     </head>
     </html>
     """
@@ -62,6 +62,65 @@ def test_parse_profile_meta_from_html():
     assert meta["followers"] == 119_000_000
     assert meta["is_verified"] is True
     assert "https://scontent.xx.fbcdn.net/v/avatar.jpg" in meta["avatar_url"]
+
+
+def test_parse_profile_meta_login_wall():
+    """Verify og:title == 'Facebook' with login description is treated as login wall with no fake metadata."""
+    sample_html = """
+    <html>
+    <head>
+    <meta property="og:title" content="Facebook">
+    <meta property="og:description" content="Log into Facebook to start sharing and connecting with your friends, family, and people you know.">
+    <script>{"is_verified": true}</script>
+    </head>
+    </html>
+    """
+    meta = parse_profile_meta_from_html(sample_html, "61592582919537")
+    assert meta["is_login_wall"] is True
+    assert meta["full_name"] is None
+    assert meta["bio"] is None
+    assert meta["followers"] is None
+    assert meta["is_verified"] is False
+
+
+@pytest.mark.asyncio
+async def test_facebook_collector_login_wall_raises(monkeypatch):
+    """Verify fetch_profile_info_and_posts raises ScraperError(facebook profile requires login) when encountering shell."""
+    from src.collectors.base import ScraperError
+
+    collector = FacebookCollector()
+    sample_html = """
+    <html>
+    <head>
+    <meta property="og:title" content="Facebook">
+    <meta property="og:description" content="">
+    </head>
+    </html>
+    """
+
+    class FakeResponse:
+        status_code = 200
+        text = sample_html
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", FakeClient)
+
+    with pytest.raises(ScraperError) as exc_info:
+        await collector.fetch_profile_info_and_posts("61592582919537")
+    assert exc_info.value.error_code == "facebook profile requires login"
+    assert exc_info.value.status_code == 401
 
 
 def test_extract_comments_from_json():
@@ -170,6 +229,32 @@ def test_extract_posts_from_json():
 
     assert posts[1]["shortcode"] == "post_older"
     assert posts[1]["like_count"] == 450
+
+
+def test_extract_posts_merging_same_node():
+    """Verify fragments for the same post merge caption and timestamp properly."""
+    sample_json = {
+        "unit1": {
+            "story": {
+                "post_id": "post_split",
+                "creation_time": 1720000000,
+                "url": "https://www.facebook.com/posts/post_split",
+            }
+        },
+        "unit2": {
+            "story": {
+                "post_id": "post_split",
+                "message": {"text": "Post split across two payload nodes."},
+                "url": "https://www.facebook.com/posts/post_split",
+            }
+        },
+    }
+    posts = extract_posts_from_json(sample_json)
+    assert len(posts) == 1
+    assert posts[0]["shortcode"] == "post_split"
+    assert posts[0]["caption"] == "Post split across two payload nodes."
+    assert posts[0]["published_at"] is not None
+    assert posts[0]["timestamp"] == 1720000000
 
 
 @pytest.mark.asyncio
