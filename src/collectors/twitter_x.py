@@ -230,6 +230,20 @@ def _patch_twikit_client() -> None:
     _patch_twikit_transaction()
     _patch_twikit_user()
     try:
+        from twikit.guest.client import GuestClient
+        if not getattr(GuestClient, "_ops_patched_gut", False):
+            orig_guest_gut = GuestClient.get_user_tweets
+            async def _safe_guest_gut(self, user_id, tweet_type="Tweets", count=40):
+                try:
+                    return await orig_guest_gut(self, user_id, tweet_type="Tweets", count=count)
+                except Exception:
+                    return []
+            GuestClient.get_user_tweets = _safe_guest_gut
+            GuestClient._ops_patched_gut = True
+    except Exception:
+        pass
+
+    try:
         from twikit.client.client import Client
         from twikit.utils import find_dict, Result
         from twikit.tweet import tweet_from_data
@@ -302,10 +316,16 @@ class TwitterXCollector(BaseCollector):
         pool_manager: Optional[SessionPoolManager] = None,
         query_id: Optional[str] = None,
         bearer_token: Optional[str] = None,
+        session_cookies: Optional[Dict[str, str]] = None,
+        proxy_url: Optional[str] = None,
+        user_agent: Optional[str] = None,
     ):
         self.pool_manager = pool_manager
         self.query_id = query_id or settings.X_TWEET_DETAIL_QUERY_ID
         self.bearer_token = bearer_token if bearer_token is not None else settings.X_BEARER_TOKEN
+        self.session_cookies = session_cookies
+        self.proxy_url = proxy_url
+        self.user_agent = user_agent
         self.last_focal_tweet_meta: Optional[Dict[str, Any]] = None
 
     async def start(self) -> None:
@@ -1627,7 +1647,11 @@ class TwitterXCollector(BaseCollector):
                         continue
 
                     pub_dt = _parse_x_created_at(leg.get("created_at"))
-                    in_reply_to_id = str(leg.get("in_reply_to_status_id_str") or leg.get("conversation_id_str") or tw_id)
+                    raw_in_reply = leg.get("in_reply_to_status_id_str")
+                    # Filter for actual replies: in_reply_to_status_id_str is non-null
+                    if not raw_in_reply:
+                        continue
+                    in_reply_to_id = str(raw_in_reply)
                     in_reply_to_user = leg.get("in_reply_to_screen_name")
                     parent_url = (
                         f"https://x.com/{in_reply_to_user}/status/{in_reply_to_id}"
@@ -1644,7 +1668,7 @@ class TwitterXCollector(BaseCollector):
                             source_name=(
                                 f"X Reply by @{clean_username} to @{in_reply_to_user}"
                                 if in_reply_to_user
-                                else f"X Post by @{clean_username}"
+                                else f"X Reply by @{clean_username}"
                             ),
                             post_url=parent_url,
                             comment_url=f"https://x.com/{clean_username}/status/{tw_id}",
@@ -1664,8 +1688,12 @@ class TwitterXCollector(BaseCollector):
         self,
         username: str,
         count: int = 20,
+        session_cookies: Optional[Dict[str, str]] = None,
+        proxy_url: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        **kwargs,
     ) -> Tuple[Dict[str, Any], List[NormalizedComment]]:
-        """Fetch an X user's own recent replies (tweet_type='Replies') and profile metadata."""
+        """Fetch an X user's own recent replies (tweet_type='Replies') and profile metadata using authenticated burner session."""
         clean_username = username.strip().lstrip("@").split("/")[0].split("?")[0]
         profile_meta: Dict[str, Any] = {
             "platform": "x",
@@ -1680,253 +1708,286 @@ class TwitterXCollector(BaseCollector):
         }
         collected: List[NormalizedComment] = []
 
-        session_tuple = None
-        if self.pool_manager:
+        cookies: Dict[str, str] = {}
+        session_obj = None
+
+        raw_in_cookies = session_cookies or self.session_cookies or kwargs.get("session_cookies")
+        if raw_in_cookies:
+            cookies = dict(raw_in_cookies)
+        proxy_url = proxy_url or self.proxy_url or kwargs.get("proxy_url")
+        user_agent = user_agent or self.user_agent or kwargs.get("user_agent")
+
+        if not cookies and self.pool_manager:
             session_tuple = await self.pool_manager.acquire_session("x")
-
-        if session_tuple:
-            session_obj, raw_cookies, proxy_url = session_tuple
-            cookies: Dict[str, str] = {}
-            if isinstance(raw_cookies, dict):
-                cookies = {str(k): str(v) for k, v in raw_cookies.items() if v is not None}
-            elif isinstance(raw_cookies, str):
-                for part in raw_cookies.split(";"):
-                    if "=" in part:
-                        k, v = part.split("=", 1)
-                        cookies[k.strip()] = v.strip()
-                if not cookies and raw_cookies.strip():
-                    cookies["auth_token"] = raw_cookies.strip()
-
-            user_agent = (
-                session_obj.user_agent
-                or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            )
-
-            try:
-                cookies = await self._refresh_ct0_cookie(cookies, user_agent=user_agent, proxy_url=proxy_url)
-                if self.pool_manager and cookies.get("ct0"):
-                    await self.pool_manager.update_session_cookies(session_obj.id, cookies)
-
-                user_id: Optional[str] = None
-
-                # 1a. Try twikit Client (gql.user_by_screen_name + get_user_tweets(..., tweet_type=TweetType.Replies))
-                try:
-                    _patch_twikit_client()
-                    from twikit import Client as TwikitClient
-                    from twikit.errors import (
-                        Unauthorized,
-                        Forbidden,
-                        NotFound,
-                        UserNotFound,
-                        UserUnavailable,
-                        TooManyRequests,
-                        AccountLocked,
-                        AccountSuspended,
-                    )
-
-                    tw_client = TwikitClient(language="en-US", proxy=proxy_url, user_agent=user_agent)
-                    tw_client.set_cookies(cookies)
-
-                    try:
-                        u_raw_resp, _ = await tw_client.gql.user_by_screen_name(clean_username)
-                        if isinstance(u_raw_resp, dict):
-                            uid, parsed_meta = self._parse_user_by_screen_name_payload(u_raw_resp, clean_username)
-                            if uid:
-                                user_id = uid
-                                profile_meta.update(parsed_meta)
-                    except (Unauthorized, Forbidden, AccountLocked, AccountSuspended, TooManyRequests, NotFound, UserNotFound, UserUnavailable):
-                        raise
-                    except Exception as raw_u_err:
-                        logger.debug("twikit raw gql.user_by_screen_name in fetch_user_replies", error=str(raw_u_err))
-
-                    if not user_id:
-                        user_obj = await tw_client.get_user_by_screen_name(clean_username)
-                        if user_obj:
-                            user_id = str(user_obj.id)
-                            profile_meta.update(
-                                {
-                                    "user_id": user_id,
-                                    "username": f"@{user_obj.screen_name or clean_username}",
-                                    "url": f"https://x.com/{user_obj.screen_name or clean_username}",
-                                    "full_name": user_obj.name or clean_username,
-                                    "bio": user_obj.description or None,
-                                    "followers": int(getattr(user_obj, "followers_count", 0) or 0),
-                                    "following": int(getattr(user_obj, "following_count", 0) or 0),
-                                    "total_posts": int(getattr(user_obj, "statuses_count", 0) or 0),
-                                    "is_verified": bool(getattr(user_obj, "is_blue_verified", False) or getattr(user_obj, "verified", False)),
-                                }
-                            )
-
-                    if user_id:
-                        # 1. Primary: twikit client.get_user_tweets with TweetType.Replies enum
+            if session_tuple:
+                session_obj, raw_cookies, p_url = session_tuple
+                proxy_url = proxy_url or p_url
+                if isinstance(raw_cookies, dict):
+                    cookies = {str(k): str(v) for k, v in raw_cookies.items() if v is not None}
+                elif isinstance(raw_cookies, str):
+                    raw_c = raw_cookies.strip()
+                    if raw_c.startswith("{"):
                         try:
-                            tw_replies = await tw_client.get_user_tweets(
-                                user_id,
-                                tweet_type=TweetType.Replies,
-                                count=max(40, count * 2),
-                            )
-                            seen_tw = set()
-                            for item in tw_replies or []:
-                                candidates = [item] + list(getattr(item, "replies", None) or [])
-                                for tw in candidates:
-                                    tw_id = str(getattr(tw, "id", "") or "")
-                                    if not tw_id or tw_id in seen_tw:
-                                        continue
-                                    tw_user = getattr(tw, "user", None)
-                                    tw_screen = (getattr(tw_user, "screen_name", "") or "").lstrip("@")
-                                    author_id = str(
-                                        getattr(tw_user, "id", "")
-                                        or (getattr(tw, "_legacy", {}).get("user_id_str") if hasattr(tw, "_legacy") else "")
-                                        or ""
-                                    )
-                                    if author_id and user_id and author_id != str(user_id):
-                                        continue
-                                    if tw_screen and tw_screen.lower() != clean_username.lower():
-                                        continue
+                            parsed_c = json.loads(raw_c)
+                            if isinstance(parsed_c, dict):
+                                cookies = {str(k): str(v) for k, v in parsed_c.items() if v is not None}
+                        except Exception:
+                            cookies = {"auth_token": raw_c}
+                    elif "=" in raw_c and ";" in raw_c:
+                        for part in raw_c.split(";"):
+                            if "=" in part:
+                                k, v = part.split("=", 1)
+                                cookies[k.strip()] = v.strip()
+                    else:
+                        cookies = {"auth_token": raw_c}
+                if session_obj:
+                    user_agent = user_agent or session_obj.user_agent
 
-                                    tw_text = (getattr(tw, "full_text", None) or getattr(tw, "text", "") or "").strip()
-                                    if not tw_text:
-                                        continue
+        if not cookies:
+            raise ScraperError("no x session configured", "No active X burner session configured", status_code=409)
 
-                                    seen_tw.add(tw_id)
-                                    pub_dt = _parse_x_created_at(getattr(tw, "created_at", None))
-                                    in_rep = str(getattr(tw, "in_reply_to", None) or tw_id)
-                                    in_rep_user = (
-                                        getattr(tw, "_legacy", {}).get("in_reply_to_screen_name")
-                                        if hasattr(tw, "_legacy")
-                                        else None
+        # Authenticate twikit client with the registered burner's auth_token + ct0 cookies
+        auth_token = cookies.get("auth_token") or cookies.get("authToken")
+        if not auth_token:
+            for k, v in cookies.items():
+                if "auth" in k.lower() or len(v) == 40:
+                    auth_token = v
+                    cookies["auth_token"] = v
+                    break
+
+        ct0 = cookies.get("ct0") or cookies.get("csrf")
+        if not ct0:
+            import secrets
+            ct0 = secrets.token_hex(16)
+            cookies["ct0"] = ct0
+
+        user_agent = (
+            user_agent
+            or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+
+        try:
+            user_id: Optional[str] = None
+
+            # 1a. Try twikit Client with authenticated session cookies
+            try:
+                _patch_twikit_client()
+                from twikit import Client as TwikitClient
+                from twikit.errors import (
+                    Unauthorized,
+                    Forbidden,
+                    NotFound,
+                    UserNotFound,
+                    UserUnavailable,
+                    TooManyRequests,
+                    AccountLocked,
+                    AccountSuspended,
+                )
+
+                tw_client = TwikitClient(language="en-US", proxy=proxy_url, user_agent=user_agent)
+                tw_client.set_cookies(cookies)
+
+                try:
+                    u_raw_resp, _ = await tw_client.gql.user_by_screen_name(clean_username)
+                    if isinstance(u_raw_resp, dict):
+                        uid, parsed_meta = self._parse_user_by_screen_name_payload(u_raw_resp, clean_username)
+                        if uid:
+                            user_id = uid
+                            profile_meta.update(parsed_meta)
+                except (Unauthorized, Forbidden, AccountLocked, AccountSuspended, TooManyRequests, NotFound, UserNotFound, UserUnavailable):
+                    raise
+                except Exception as raw_u_err:
+                    logger.debug("twikit raw gql.user_by_screen_name in fetch_user_replies", error=str(raw_u_err))
+
+                if not user_id:
+                    user_obj = await tw_client.get_user_by_screen_name(clean_username)
+                    if user_obj:
+                        user_id = str(user_obj.id)
+                        profile_meta.update(
+                            {
+                                "user_id": user_id,
+                                "username": f"@{user_obj.screen_name or clean_username}",
+                                "url": f"https://x.com/{user_obj.screen_name or clean_username}",
+                                "full_name": user_obj.name or clean_username,
+                                "bio": user_obj.description or None,
+                                "followers": int(getattr(user_obj, "followers_count", 0) or 0),
+                                "following": int(getattr(user_obj, "following_count", 0) or 0),
+                                "total_posts": int(getattr(user_obj, "statuses_count", 0) or 0),
+                                "is_verified": bool(getattr(user_obj, "is_blue_verified", False) or getattr(user_obj, "verified", False)),
+                            }
+                        )
+
+                if user_id:
+                    # 1. Primary: twikit client.get_user_tweets with TweetType.Replies enum
+                    try:
+                        tw_replies = await tw_client.get_user_tweets(
+                            user_id,
+                            tweet_type=TweetType.Replies,
+                            count=max(40, count * 2),
+                        )
+                        seen_tw = set()
+                        for item in tw_replies or []:
+                            candidates = [item] + list(getattr(item, "replies", None) or [])
+                            for tw in candidates:
+                                tw_id = str(getattr(tw, "id", "") or "")
+                                if not tw_id or tw_id in seen_tw:
+                                    continue
+
+                                # Filter for actual replies: in_reply_to_status_id_str is non-null
+                                in_reply_to_id = getattr(tw, "in_reply_to", None) or (
+                                    getattr(tw, "_legacy", {}).get("in_reply_to_status_id_str")
+                                    if hasattr(tw, "_legacy")
+                                    else None
+                                )
+                                if not in_reply_to_id:
+                                    continue
+
+                                tw_user = getattr(tw, "user", None)
+                                tw_screen = (getattr(tw_user, "screen_name", "") or "").lstrip("@")
+                                author_id = str(
+                                    getattr(tw_user, "id", "")
+                                    or (getattr(tw, "_legacy", {}).get("user_id_str") if hasattr(tw, "_legacy") else "")
+                                    or ""
+                                )
+                                if author_id and user_id and author_id != str(user_id):
+                                    continue
+                                if tw_screen and tw_screen.lower() != clean_username.lower():
+                                    continue
+
+                                tw_text = (getattr(tw, "full_text", None) or getattr(tw, "text", "") or "").strip()
+                                if not tw_text:
+                                    continue
+
+                                seen_tw.add(tw_id)
+                                pub_dt = _parse_x_created_at(getattr(tw, "created_at", None))
+                                in_rep = str(in_reply_to_id)
+                                in_rep_user = (
+                                    getattr(tw, "_legacy", {}).get("in_reply_to_screen_name")
+                                    if hasattr(tw, "_legacy")
+                                    else None
+                                )
+                                source_name = (
+                                    f"X Reply by @{clean_username} to @{in_rep_user}"
+                                    if in_rep_user
+                                    else f"X Reply by @{clean_username}"
+                                )
+                                collected.append(
+                                    NormalizedComment(
+                                        platform="x",
+                                        external_comment_id=f"x_{tw_id}",
+                                        parent_external_id=in_rep,
+                                        target_external_id=f"@{clean_username}",
+                                        source_name=source_name,
+                                        post_url=(
+                                            f"https://x.com/{in_rep_user}/status/{in_rep}"
+                                            if in_rep_user
+                                            else f"https://x.com/i/status/{in_rep}"
+                                        ),
+                                        comment_url=f"https://x.com/{clean_username}/status/{tw_id}",
+                                        author_external_id=user_id,
+                                        author_username=clean_username,
+                                        author_display_name=profile_meta.get("full_name") or clean_username,
+                                        content_text=tw_text,
+                                        published_at=pub_dt,
+                                        child_comment_count=int(getattr(tw, "reply_count", 0) or 0),
                                     )
-                                    source_name = (
-                                        f"X Reply by @{clean_username} to @{in_rep_user}"
-                                        if in_rep_user
-                                        else f"X Reply by @{clean_username}"
-                                    )
-                                    collected.append(
-                                        NormalizedComment(
-                                            platform="x",
-                                            external_comment_id=f"x_{tw_id}",
-                                            parent_external_id=in_rep,
-                                            target_external_id=f"@{clean_username}",
-                                            source_name=source_name,
-                                            post_url=(
-                                                f"https://x.com/{in_rep_user}/status/{in_rep}"
-                                                if in_rep_user
-                                                else f"https://x.com/i/status/{in_rep}"
-                                            ),
-                                            comment_url=f"https://x.com/{clean_username}/status/{tw_id}",
-                                            author_external_id=user_id,
-                                            author_username=clean_username,
-                                            author_display_name=profile_meta.get("full_name") or clean_username,
-                                            content_text=tw_text,
-                                            published_at=pub_dt,
-                                            child_comment_count=int(getattr(tw, "reply_count", 0) or 0),
-                                        )
-                                    )
-                                    if len(collected) >= count:
-                                        break
+                                )
                                 if len(collected) >= count:
                                     break
-                        except Exception as gut_err:
-                            logger.debug("twikit client.get_user_tweets(TweetType.Replies) fallback", error=str(gut_err))
+                            if len(collected) >= count:
+                                break
+                    except (Unauthorized, Forbidden, AccountLocked, AccountSuspended) as auth_err:
+                        raise ScraperError("x session rejected", f"X session rejected: {auth_err}", status_code=401)
+                    except TooManyRequests as rl_err:
+                        raise ScraperError("rate limited", f"X rate limited: {rl_err}", status_code=429)
+                    except Exception as gut_err:
+                        logger.debug("twikit client.get_user_tweets(TweetType.Replies) fallback", error=str(gut_err))
 
-                        # 2. Secondary: direct raw gql.user_tweets_and_replies
-                        if not collected:
-                            try:
-                                rep_raw_resp, _ = await tw_client.gql.user_tweets_and_replies(user_id, max(40, count * 2), None)
-                                if isinstance(rep_raw_resp, dict):
-                                    collected = self._parse_user_replies_payload(
-                                        rep_raw_resp,
-                                        clean_username=clean_username,
-                                        user_id=user_id,
-                                        count=count,
-                                    )
-                            except Exception as raw_r_err:
-                                logger.debug("twikit raw gql.user_tweets_and_replies fallback", error=str(raw_r_err))
+                    # 2. Secondary: direct raw gql.user_tweets_and_replies
+                    if not collected:
+                        try:
+                            rep_raw_resp, _ = await tw_client.gql.user_tweets_and_replies(user_id, max(40, count * 2), None)
+                            if isinstance(rep_raw_resp, dict):
+                                collected = self._parse_user_replies_payload(
+                                    rep_raw_resp,
+                                    clean_username=clean_username,
+                                    user_id=user_id,
+                                    count=count,
+                                )
+                        except (Unauthorized, Forbidden, AccountLocked, AccountSuspended) as auth_err:
+                            raise ScraperError("x session rejected", f"X session rejected: {auth_err}", status_code=401)
+                        except TooManyRequests as rl_err:
+                            raise ScraperError("rate limited", f"X rate limited: {rl_err}", status_code=429)
+                        except Exception as raw_r_err:
+                            logger.debug("twikit raw gql.user_tweets_and_replies fallback", error=str(raw_r_err))
 
-                    rotated = tw_client.get_cookies()
-                    if rotated and self.pool_manager:
-                        cookies.update({str(k): str(v) for k, v in rotated.items() if v})
-                        await self.pool_manager.update_session_cookies(session_obj.id, cookies)
+                rotated = tw_client.get_cookies()
+                if rotated and session_obj and self.pool_manager:
+                    cookies.update({str(k): str(v) for k, v in rotated.items() if v})
+                    await self.pool_manager.update_session_cookies(session_obj.id, cookies)
 
-                except (Unauthorized, Forbidden, AccountLocked, AccountSuspended) as auth_err:
-                    raise ScraperError("x session rejected", f"X session rejected: {auth_err}", status_code=401)
-                except TooManyRequests as rl_err:
-                    raise ScraperError("rate limited", f"X rate limited: {rl_err}", status_code=429)
-                except (NotFound, UserNotFound, UserUnavailable) as nf_err:
-                    raise ScraperError("profile not found", f"X user @{clean_username} not found: {nf_err}", status_code=404)
-                except ScraperError:
-                    raise
-                except Exception as tw_err:
-                    logger.warning("twikit fetch_user_replies failed; trying direct HTTP GraphQL", username=clean_username, error=str(tw_err))
-
-                # 1b. Direct HTTP GraphQL fallback for UserTweetsAndReplies
-                if not collected:
-                    headers = {
-                        "authorization": X_PUBLIC_WEB_BEARER,
-                        "x-csrf-token": cookies.get("ct0", ""),
-                        "x-twitter-active-user": "yes",
-                        "x-twitter-auth-type": "OAuth2Session",
-                        "x-twitter-client-language": "en",
-                        "user-agent": user_agent,
-                        "content-type": "application/json",
-                        "Referer": f"https://x.com/{clean_username}/with_replies",
-                    }
-                    async with httpx.AsyncClient(cookies=cookies, proxy=proxy_url, headers=headers, timeout=25.0) as client:
-                        if not user_id:
-                            for u_qid in X_USER_BY_SCREEN_NAME_QUERY_IDS:
-                                u_url = f"https://x.com/i/api/graphql/{u_qid}/UserByScreenName"
-                                u_params = {
-                                    "variables": json.dumps({"screen_name": clean_username, "withSafetyModeUserFields": True}),
-                                    "features": json.dumps(X_USER_FEATURES),
-                                    "fieldToggles": json.dumps({"withAuxiliaryUserLabels": False}),
-                                }
-                                u_resp = await client.get(u_url, params=u_params)
-                                if u_resp.status_code == 200:
-                                    uid, p_meta = self._parse_user_by_screen_name_payload(u_resp.json(), clean_username)
-                                    if uid:
-                                        user_id = uid
-                                        profile_meta.update(p_meta)
-                                        break
-
-                        if user_id:
-                            for r_qid in X_USER_TWEETS_AND_REPLIES_QUERY_IDS:
-                                r_url = f"https://x.com/i/api/graphql/{r_qid}/UserTweetsAndReplies"
-                                r_variables = {
-                                    "userId": user_id,
-                                    "count": max(40, count * 2),
-                                    "includePromotedContent": True,
-                                    "withCommunity": True,
-                                    "withVoice": True,
-                                    "withV2Timeline": True,
-                                }
-                                r_params = {
-                                    "variables": json.dumps(r_variables),
-                                    "features": json.dumps(X_GRAPHQL_FEATURES),
-                                    "fieldToggles": json.dumps({"withArticlePlainText": False}),
-                                }
-                                r_resp = await client.get(r_url, params=r_params)
-                                if r_resp.status_code == 429:
-                                    raise ScraperError("rate limited", "X rate limit exceeded (HTTP 429)", status_code=429)
-                                if r_resp.status_code in (401, 403):
-                                    raise ScraperError("x session rejected", f"X rejected session (HTTP {r_resp.status_code})", status_code=401)
-                                if r_resp.status_code == 200:
-                                    collected = self._parse_user_replies_payload(
-                                        r_resp.json(),
-                                        clean_username=clean_username,
-                                        user_id=user_id,
-                                        count=count,
-                                    )
-                                    if collected:
-                                        break
-
-                return profile_meta, collected[:count]
-
-            except ScraperError as s_err:
-                if s_err.error_code == "x session rejected" and self.pool_manager:
-                    await self.pool_manager.report_session_error(session_obj.id)
-                elif s_err.error_code == "rate limited" and self.pool_manager:
-                    await self.pool_manager.report_rate_limit(session_obj.id, cooldown_minutes=15)
+            except (Unauthorized, Forbidden, AccountLocked, AccountSuspended) as auth_err:
+                raise ScraperError("x session rejected", f"X session rejected: {auth_err}", status_code=401)
+            except TooManyRequests as rl_err:
+                raise ScraperError("rate limited", f"X rate limited: {rl_err}", status_code=429)
+            except (NotFound, UserNotFound, UserUnavailable) as nf_err:
+                raise ScraperError("profile not found", f"X user @{clean_username} not found: {nf_err}", status_code=404)
+            except ScraperError:
                 raise
+            except Exception as tw_err:
+                logger.warning("twikit fetch_user_replies failed; trying direct HTTP GraphQL", username=clean_username, error=str(tw_err))
+
+            # 1b. Direct HTTP GraphQL fallback for UserTweetsAndReplies
+            if not collected and user_id:
+                headers = {
+                    "authorization": X_PUBLIC_WEB_BEARER,
+                    "x-csrf-token": cookies.get("ct0", ""),
+                    "x-twitter-active-user": "yes",
+                    "x-twitter-auth-type": "OAuth2Session",
+                    "x-twitter-client-language": "en",
+                    "user-agent": user_agent,
+                    "content-type": "application/json",
+                    "Referer": f"https://x.com/{clean_username}/with_replies",
+                }
+                async with httpx.AsyncClient(cookies=cookies, proxy=proxy_url, headers=headers, timeout=25.0) as client:
+                    for r_qid in X_USER_TWEETS_AND_REPLIES_QUERY_IDS:
+                        r_url = f"https://x.com/i/api/graphql/{r_qid}/UserTweetsAndReplies"
+                        r_variables = {
+                            "userId": user_id,
+                            "count": max(40, count * 2),
+                            "includePromotedContent": True,
+                            "withCommunity": True,
+                            "withVoice": True,
+                            "withV2Timeline": True,
+                        }
+                        r_params = {
+                            "variables": json.dumps(r_variables),
+                            "features": json.dumps(X_GRAPHQL_FEATURES),
+                            "fieldToggles": json.dumps({"withArticlePlainText": False}),
+                        }
+                        r_resp = await client.get(r_url, params=r_params)
+                        if r_resp.status_code == 429:
+                            raise ScraperError("rate limited", "X rate limit exceeded (HTTP 429)", status_code=429)
+                        if r_resp.status_code in (401, 403):
+                            raise ScraperError("x session rejected", f"X rejected session (HTTP {r_resp.status_code})", status_code=401)
+                        if r_resp.status_code == 200:
+                            collected = self._parse_user_replies_payload(
+                                r_resp.json(),
+                                clean_username=clean_username,
+                                user_id=user_id,
+                                count=count,
+                            )
+                            if collected:
+                                break
+
+            return profile_meta, collected[:count]
+
+        except ScraperError as s_err:
+            if s_err.error_code == "x session rejected" and session_obj and self.pool_manager:
+                await self.pool_manager.report_session_error(session_obj.id)
+            elif s_err.error_code == "rate limited" and session_obj and self.pool_manager:
+                await self.pool_manager.report_rate_limit(session_obj.id, cooldown_minutes=15)
+            raise
 
         raise ScraperError("no x session configured", "No active X burner session configured", status_code=409)
 

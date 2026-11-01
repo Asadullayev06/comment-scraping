@@ -1778,8 +1778,43 @@ async def handle_replies(request: web.Request) -> web.Response:
                 status=409,
             )
 
+        burner_cookies: Dict[str, str] = {}
+        proxy_url = None
+        user_agent = None
+        if x_sess and x_sess.cookies_encrypted:
+            try:
+                decrypted = s_repo.decrypt_data(x_sess.cookies_encrypted)
+                if isinstance(decrypted, dict):
+                    burner_cookies = {str(k): str(v) for k, v in decrypted.items() if v is not None}
+                elif isinstance(decrypted, str):
+                    raw_c = decrypted.strip()
+                    if raw_c.startswith("{"):
+                        import json as _json
+                        try:
+                            parsed_c = _json.loads(raw_c)
+                            if isinstance(parsed_c, dict):
+                                burner_cookies = {str(k): str(v) for k, v in parsed_c.items() if v is not None}
+                        except Exception:
+                            burner_cookies = {"auth_token": raw_c}
+                    elif "=" in raw_c and ";" in raw_c:
+                        for part in raw_c.split(";"):
+                            if "=" in part:
+                                k, v = part.split("=", 1)
+                                burner_cookies[k.strip()] = v.strip()
+                    else:
+                        burner_cookies = {"auth_token": raw_c}
+                proxy_url = x_sess.proxy_url
+                user_agent = x_sess.user_agent
+            except Exception as dec_err:
+                logger.warning("Failed to decrypt X session cookies in handle_replies", error=str(dec_err))
+
         pool_mgr = SessionPoolManager(session)
-        x_collector = TwitterXCollector(pool_mgr)
+        x_collector = TwitterXCollector(
+            pool_mgr,
+            session_cookies=burner_cookies if burner_cookies else None,
+            proxy_url=proxy_url,
+            user_agent=user_agent,
+        )
         try:
             profile_meta, norm_replies = await x_collector.fetch_user_replies(x_username, count=limit)
         except ScraperError as s_err:
