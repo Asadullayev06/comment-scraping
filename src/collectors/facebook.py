@@ -512,12 +512,23 @@ class FacebookCollector(BaseCollector):
             except Exception as pw_err:
                 logger.warning("Facebook profile Playwright fallback failed", handle=clean_handle, error=str(pw_err))
 
-        # Check login wall: if og:title was Facebook with no bio, or metadata failed to resolve
-        if is_shell_login_wall or (
-            profile_meta.get("full_name") in (None, "Facebook")
-            and profile_meta.get("bio") is None
-            and profile_meta.get("followers") is None
-        ):
+        # If shell page had og:title="Facebook", ensure full_name is null and verified is false
+        if profile_meta.get("full_name") in (None, "Facebook"):
+            profile_meta["full_name"] = None
+            if is_shell_login_wall:
+                profile_meta["bio"] = None
+                profile_meta["followers"] = None
+                profile_meta["is_verified"] = False
+
+        # Only raise login error if metadata failed to resolve AND no posts could be extracted
+        if (
+            is_shell_login_wall
+            or (
+                profile_meta.get("full_name") is None
+                and profile_meta.get("bio") is None
+                and profile_meta.get("followers") is None
+            )
+        ) and not recent_posts:
             raise ScraperError(
                 "facebook profile requires login",
                 f"Facebook profile '@{clean_handle}' requires login or active burner session",
