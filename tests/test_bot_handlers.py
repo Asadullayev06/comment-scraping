@@ -35,6 +35,38 @@ def test_detect_platform_and_id():
     assert t == "post_url"
     assert eid == "1792345678901234567"
 
+    # Facebook post URLs
+    p, t, eid, _ = detect_platform_and_id("https://www.facebook.com/username/posts/10114294029482931")
+    assert p == "facebook"
+    assert t == "post_url"
+    assert eid == "10114294029482931"
+
+    p, t, eid, _ = detect_platform_and_id("https://www.facebook.com/permalink.php?story_fbid=pfbid02G7w8xYq9pZ&id=10001")
+    assert p == "facebook"
+    assert t == "post_url"
+    assert eid == "pfbid02G7w8xYq9pZ"
+
+    p, t, eid, _ = detect_platform_and_id("https://www.facebook.com/watch/?v=1122334455")
+    assert p == "facebook"
+    assert t == "post_url"
+    assert eid == "1122334455"
+
+    p, t, eid, _ = detect_platform_and_id("https://fb.watch/abcd1234/")
+    assert p == "facebook"
+    assert t == "post_url"
+    assert eid == "abcd1234"
+
+    # Facebook profile URLs
+    p, t, eid, _ = detect_platform_and_id("https://www.facebook.com/zuck")
+    assert p == "facebook"
+    assert t == "profile"
+    assert eid == "zuck"
+
+    p, t, eid, _ = detect_platform_and_id("https://www.facebook.com/profile.php?id=4")
+    assert p == "facebook"
+    assert t == "profile"
+    assert eid == "4"
+
 
 def test_generate_html_report():
     comments = [

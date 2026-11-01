@@ -998,5 +998,126 @@ async def test_bridge_x_scrape_replies_and_explicit_errors(bridge_client, monkey
     assert bool(real_reply.in_reply_to) is True
 
 
+@pytest.mark.asyncio
+async def test_bridge_facebook_profile_and_scrape(bridge_client, monkeypatch):
+    """Verify Facebook profile resolution, /api/posts, /api/profile, and /api/scrape."""
+    from datetime import datetime, timezone
+    from src.collectors.facebook import FacebookCollector
+    from src.schemas.comment import NormalizedComment
+    from src.db.repositories.session_repo import SessionRepository
+    from src.api.bridge import _extract_facebook_profile_username
+
+    # Test _extract_facebook_profile_username
+    assert _extract_facebook_profile_username("https://www.facebook.com/zuck") == "zuck"
+    assert _extract_facebook_profile_username("https://www.facebook.com/profile.php?id=4") == "4"
+    assert _extract_facebook_profile_username("@zuck", explicit_platform="facebook") == "zuck"
+    assert _extract_facebook_profile_username("https://www.facebook.com/zuck/posts/10114294029482931") is None
+
+    # Register healthy Facebook session in test DB
+    async with bridge_mod.async_session_factory() as session:
+        s_repo = SessionRepository(session)
+        await s_repo.add_session(
+            platform="facebook",
+            account_identifier="fb_test_burner",
+            cookies={"c_user": "10009999", "xs": "fb_xs_secret", "fb_dtsg": "fb_dtsg_secret"},
+            user_agent="Mozilla/5.0 TestBrowser",
+        )
+        await session.commit()
+
+    fake_fb_meta = {
+        "platform": "facebook",
+        "username": "@zuck",
+        "url": "https://www.facebook.com/zuck/",
+        "full_name": "Mark Zuckerberg",
+        "bio": "Building AI and Meta platforms.",
+        "followers": 119_000_000,
+        "following": 50,
+        "total_posts": 2,
+        "is_verified": True,
+    }
+    fake_fb_posts = [
+        {
+            "post_index": 1,
+            "shortcode": "10114294029482931",
+            "url": "https://www.facebook.com/zuck/posts/10114294029482931",
+            "caption": "Our latest open source AI model is now available.",
+            "comment_count": 85,
+            "like_count": 12000,
+            "published_at": "2026-10-31 15:00",
+        },
+        {
+            "post_index": 2,
+            "shortcode": "10114294029482930",
+            "url": "https://www.facebook.com/zuck/posts/10114294029482930",
+            "caption": "Meta updates and vision for the future.",
+            "comment_count": 40,
+            "like_count": 5000,
+            "published_at": "2026-10-30 12:00",
+        },
+    ]
+
+    async def mock_fetch_profile_info_and_posts(self, username_or_id: str, count: int = 5):
+        return fake_fb_meta, fake_fb_posts[:count]
+
+    async def mock_fetch_comments(self, target, cursor=None, limit=200):
+        yield NormalizedComment(
+            platform="facebook",
+            external_comment_id=f"fb_c_{target.external_id}_1",
+            target_external_id=target.external_id,
+            source_name="Facebook Target",
+            post_url=target.url,
+            comment_url=f"https://www.facebook.com/{target.external_id}?comment_id=901",
+            author_external_id="fb_user_888",
+            author_username="john_doe",
+            author_display_name="John Doe",
+            content_text="This new policy is terrible and hurts users!",
+            published_at=datetime.now(timezone.utc),
+        )
+
+    monkeypatch.setattr(FacebookCollector, "fetch_profile_info_and_posts", mock_fetch_profile_info_and_posts)
+    monkeypatch.setattr(FacebookCollector, "fetch_comments", mock_fetch_comments)
+
+    # 1. Test GET /api/posts for Facebook
+    posts_resp = await bridge_client.get("/api/posts?target=https://www.facebook.com/zuck")
+    assert posts_resp.status == 200
+    posts_data = await posts_resp.json()
+    assert posts_data["profile"]["username"] == "@zuck"
+    assert len(posts_data["recent_posts"]) == 2
+    assert posts_data["recent_posts"][0]["shortcode"] == "10114294029482931"
+
+    # 2. Test POST /api/profile for Facebook (metadata & cadence without scraping comments)
+    prof_resp = await bridge_client.post(
+        "/api/profile",
+        json={"handle": "https://www.facebook.com/zuck", "posts": 1, "scrape": False},
+    )
+    assert prof_resp.status == 200
+    prof_data = await prof_resp.json()
+    assert prof_data["profile"]["username"] == "@zuck"
+    assert prof_data["profile"]["followers"] == 119_000_000
+    assert prof_data["cadence_and_engagement"]["posts_analyzed"] == 1
+
+    # 3. Test POST /api/scrape with Facebook profile URL (auto-resolves latest post)
+    scrape_prof_resp = await bridge_client.post(
+        "/api/scrape",
+        json={"url": "https://www.facebook.com/zuck"},
+    )
+    assert scrape_prof_resp.status == 200
+    scrape_prof_data = await scrape_prof_resp.json()
+    assert scrape_prof_data["target"]["platform"] == "facebook"
+    assert scrape_prof_data["resolved_post"]["shortcode"] == "10114294029482931"
+    assert scrape_prof_data["scrape_result"]["newly_ingested"] == 1
+
+    # 4. Test POST /api/scrape with direct Facebook post URL (verifies deduplication)
+    scrape_post_resp = await bridge_client.post(
+        "/api/scrape",
+        json={"url": "https://www.facebook.com/zuck/posts/10114294029482931"},
+    )
+    assert scrape_post_resp.status == 200
+    scrape_post_data = await scrape_post_resp.json()
+    assert scrape_post_data["target"]["platform"] == "facebook"
+    assert scrape_post_data["target"]["external_id"] == "10114294029482931"
+    assert scrape_post_data["scrape_result"]["newly_ingested"] == 0
+
+
 
 

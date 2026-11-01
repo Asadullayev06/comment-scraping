@@ -70,8 +70,42 @@ def detect_platform_and_id(input_str: str) -> Tuple[Optional[str], Optional[str]
     # Facebook
     if "facebook.com" in text or "fb.watch" in text:
         platform = "facebook"
-        target_type = "post_url"
-        return platform, target_type, text, text
+
+        # Check post / video / photo / reel / share patterns
+        post_match = (
+            re.search(r"/posts/([A-Za-z0-9_.-]+)", text)
+            or re.search(r"story_fbid=([A-Za-z0-9_.-]+)", text)
+            or re.search(r"fbid=(\d+)", text)
+            or re.search(r"/videos/(\d+)", text)
+            or re.search(r"/watch/?\?v=(\d+)", text)
+            or re.search(r"/reel/(\d+)", text)
+            or re.search(r"fb\.watch/([A-Za-z0-9_.-]+)", text)
+            or re.search(r"/share/[pvr]/([A-Za-z0-9_.-]+)", text)
+        )
+        if post_match:
+            return platform, "post_url", post_match.group(1), text
+
+        # Profile / page URL patterns
+        prof_id_match = re.search(r"profile\.php\?id=(\d+)", text)
+        if prof_id_match:
+            return platform, "profile", prof_id_match.group(1), text
+
+        page_id_match = re.search(r"/pages/[^/]+/(\d+)", text)
+        if page_id_match:
+            return platform, "profile", page_id_match.group(1), text
+
+        prof_user_match = re.search(r"facebook\.com/([A-Za-z0-9_.-]+)(?:[/?#]|$)", text)
+        if prof_user_match:
+            slug = prof_user_match.group(1).lower()
+            reserved = {
+                "home", "watch", "reel", "reels", "groups", "pages", "events",
+                "marketplace", "gaming", "stories", "share", "help", "login",
+                "settings", "messages", "notifications", "photo", "photos",
+            }
+            if slug not in reserved:
+                return platform, "profile", prof_user_match.group(1), text
+
+        return platform, "post_url", text, text
 
     return None, None, None, text
 

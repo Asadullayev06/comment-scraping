@@ -191,6 +191,49 @@ def _extract_youtube_profile_username(raw_input: str, explicit_platform: str = "
     return None
 
 
+def _extract_facebook_profile_username(raw_input: str, explicit_platform: str = "") -> Optional[str]:
+    """Return Facebook profile/page username or numeric ID if raw_input is a Facebook profile URL or handle."""
+    text = raw_input.strip()
+    if not text or text.lower() == "list":
+        return None
+
+    lower = text.lower()
+    # If it is a post/media URL, it is NOT a profile
+    if any(marker in lower for marker in ("/posts/", "story_fbid=", "fbid=", "/videos/", "/watch", "/reel/", "fb.watch", "/share/")):
+        return None
+
+    if "facebook.com/" in lower:
+        # Check profile.php?id=<id>
+        m_id = re.search(r"profile\.php\?id=(\d+)", text)
+        if m_id:
+            return m_id.group(1)
+
+        # Check pages/<name>/<id>
+        m_page = re.search(r"/pages/[^/]+/(\d+)", text)
+        if m_page:
+            return m_page.group(1)
+
+        # Check slug: facebook.com/<slug>
+        m_slug = re.search(r"facebook\.com/([A-Za-z0-9_.-]+)(?:[/?#]|$)", text)
+        if m_slug:
+            slug = m_slug.group(1).lower()
+            reserved = {
+                "home", "watch", "reel", "reels", "groups", "pages", "events",
+                "marketplace", "gaming", "stories", "share", "help", "login",
+                "settings", "messages", "notifications", "photo", "photos",
+            }
+            if slug not in reserved:
+                return m_slug.group(1)
+        return None
+
+    if explicit_platform == "facebook":
+        candidate = text.lstrip("@").strip()
+        if re.match(r"^[A-Za-z0-9_.-]{2,50}$", candidate):
+            return candidate
+
+    return None
+
+
 async def _resolve_target(session: AsyncSession, raw_target: str) -> Optional[MonitoredTarget]:
     """Resolve a MonitoredTarget by UUID, external_id, @handle, or full URL."""
     clean = raw_target.strip()
@@ -685,6 +728,34 @@ async def _fetch_youtube_profile_and_posts(
         await yt_collector.stop()
 
 
+async def _fetch_facebook_profile_and_posts(
+    fb_collector: FacebookCollector,
+    username: str,
+    count: int = 5,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Fetch Facebook profile metadata and recent posts, supporting both full and monkeypatched collectors."""
+    if getattr(FacebookCollector.fetch_profile_recent_posts, "__name__", "") != "fetch_profile_recent_posts":
+        posts = await fb_collector.fetch_profile_recent_posts(username, count=count)
+        meta = {
+            "platform": "facebook",
+            "username": f"@{username.lstrip('@')}",
+            "url": f"https://www.facebook.com/{username.lstrip('@')}/",
+            "full_name": username.lstrip("@"),
+            "bio": None,
+            "followers": None,
+            "following": None,
+            "total_posts": len(posts),
+            "is_verified": False,
+        }
+        return meta, posts
+
+    meta, posts = await fb_collector.fetch_profile_info_and_posts(username, count=count)
+    if not posts:
+        posts = await fb_collector.fetch_profile_recent_posts(username, count=count)
+    meta["posts_returned"] = len(posts)
+    return meta, posts
+
+
 async def _execute_profile_analysis(
     ig_username: str,
     posts_count: int = 3,
@@ -694,7 +765,7 @@ async def _execute_profile_analysis(
     mtproto: Optional[Any] = None,
     platform: str = "instagram",
 ) -> Tuple[Optional[Dict[str, Any]], int]:
-    """Enumerate an Instagram, X, or YouTube profile's last N posts, scrape & score comments/replies on each, and aggregate."""
+    """Enumerate an Instagram, X, Facebook, or YouTube profile's last N posts, scrape & score comments/replies on each, and aggregate."""
     posts_count = min(max(1, posts_count), 5)  # Hard cap at 5 posts to protect burner session
 
     async with async_session_factory() as session:
@@ -714,6 +785,17 @@ async def _execute_profile_analysis(
             yt_collector = YouTubeCollector()
             profile_meta, recent_posts = await _fetch_youtube_profile_and_posts(
                 yt_collector,
+                ig_username,
+                count=max(5, posts_count),
+            )
+        elif platform == "facebook":
+            fb_sess = await s_repo.get_healthy_session("facebook")
+            if not fb_sess:
+                raise ScraperError("no facebook session configured", "No active Facebook burner session configured", status_code=409)
+            pool_mgr = SessionPoolManager(session)
+            fb_collector = FacebookCollector(pool_mgr)
+            profile_meta, recent_posts = await _fetch_facebook_profile_and_posts(
+                fb_collector,
                 ig_username,
                 count=max(5, posts_count),
             )
@@ -938,7 +1020,7 @@ async def _execute_profile_analysis(
 
 
 async def handle_posts(request: web.Request) -> web.Response:
-    """GET /api/posts?target=@handle&count=5 — List recent posts of an Instagram, X, or YouTube profile without scraping comments."""
+    """GET /api/posts?target=@handle&count=5 — List recent posts of an Instagram, X, Facebook, or YouTube profile without scraping comments."""
     target_input = (
         request.query.get("target")
         or request.query.get("handle")
@@ -951,11 +1033,12 @@ async def handle_posts(request: web.Request) -> web.Response:
 
     yt_username = _extract_youtube_profile_username(target_input, explicit_platform=explicit_platform)
     x_username = None if yt_username else _extract_x_profile_username(target_input, explicit_platform=explicit_platform)
-    ig_username = None if (yt_username or x_username) else _extract_instagram_profile_username(target_input)
+    fb_username = None if (yt_username or x_username) else _extract_facebook_profile_username(target_input, explicit_platform=explicit_platform)
+    ig_username = None if (yt_username or x_username or fb_username) else _extract_instagram_profile_username(target_input)
 
-    if not yt_username and not x_username and not ig_username:
+    if not yt_username and not x_username and not fb_username and not ig_username:
         return web.json_response(
-            {"error": f"Provide a valid Instagram, X, or YouTube handle/profile URL (got '{target_input}')."},
+            {"error": f"Provide a valid Instagram, X, YouTube, or Facebook handle/profile URL (got '{target_input}')."},
             status=400,
         )
 
@@ -977,6 +1060,15 @@ async def handle_posts(request: web.Request) -> web.Response:
                 if not recent_posts:
                     return web.json_response(
                         {"error": f"Could not fetch posts for X profile '@{x_username}'."},
+                        status=404,
+                    )
+                return web.json_response({"profile": profile_meta, "recent_posts": recent_posts})
+            elif fb_username:
+                fb_collector = FacebookCollector(pool_mgr)
+                profile_meta, recent_posts = await _fetch_facebook_profile_and_posts(fb_collector, fb_username, count=count)
+                if not recent_posts:
+                    return web.json_response(
+                        {"error": f"Could not fetch posts for Facebook profile '{fb_username}'."},
                         status=404,
                     )
                 return web.json_response({"profile": profile_meta, "recent_posts": recent_posts})
@@ -1019,13 +1111,14 @@ async def handle_profile(request: web.Request) -> web.Response:
     explicit_platform = (body.get("platform") or request.query.get("platform") or "").strip().lower()
     yt_username = _extract_youtube_profile_username(raw_handle, explicit_platform=explicit_platform)
     x_username = None if yt_username else _extract_x_profile_username(raw_handle, explicit_platform=explicit_platform)
-    ig_username = None if (yt_username or x_username) else _extract_instagram_profile_username(raw_handle)
-    prof_username = yt_username or x_username or ig_username
-    prof_platform = "youtube" if yt_username else ("x" if x_username else "instagram")
+    fb_username = None if (yt_username or x_username) else _extract_facebook_profile_username(raw_handle, explicit_platform=explicit_platform)
+    ig_username = None if (yt_username or x_username or fb_username) else _extract_instagram_profile_username(raw_handle)
+    prof_username = yt_username or x_username or fb_username or ig_username
+    prof_platform = "youtube" if yt_username else ("x" if x_username else ("facebook" if fb_username else "instagram"))
 
     if not prof_username:
         return web.json_response(
-            {"error": f"Could not parse Instagram, X, or YouTube handle from '{raw_handle}'."},
+            {"error": f"Could not parse Instagram, X, YouTube, or Facebook handle from '{raw_handle}'."},
             status=400,
         )
 
@@ -1243,9 +1336,10 @@ async def handle_scrape(request: web.Request) -> web.Response:
     profile_recent_preview: Optional[List[Dict[str, Any]]] = None
     yt_username = _extract_youtube_profile_username(raw_url, explicit_platform=explicit_platform)
     x_username = None if yt_username else _extract_x_profile_username(raw_url, explicit_platform=explicit_platform)
-    ig_username = None if (yt_username or x_username) else (_extract_instagram_profile_username(raw_url) if explicit_platform != "telegram" else None)
-    prof_username = yt_username or x_username or ig_username
-    prof_platform = "youtube" if yt_username else ("x" if x_username else "instagram")
+    fb_username = None if (yt_username or x_username) else _extract_facebook_profile_username(raw_url, explicit_platform=explicit_platform)
+    ig_username = None if (yt_username or x_username or fb_username) else (_extract_instagram_profile_username(raw_url) if explicit_platform != "telegram" else None)
+    prof_username = yt_username or x_username or fb_username or ig_username
+    prof_platform = "youtube" if yt_username else ("x" if x_username else ("facebook" if fb_username else "instagram"))
 
     if prof_username and explicit_posts > 1:
         mtproto = request.app.get("mtproto")
@@ -1395,6 +1489,77 @@ async def handle_scrape(request: web.Request) -> web.Response:
                     "caption": _truncate(p.get("caption"), 70),
                 }
                 for p in posts[:5]
+            ]
+    elif fb_username:
+        async with async_session_factory() as session:
+            s_repo = SessionRepository(session)
+            fb_sess = await s_repo.get_healthy_session("facebook")
+            if not fb_sess:
+                return web.json_response(
+                    {
+                        "error": "no facebook session configured",
+                        "platform": "facebook",
+                        "hint": "Add a Facebook burner session via 'ops sessions --add facebook <account> <cookies_json>'.",
+                    },
+                    status=409,
+                )
+            pool_mgr = SessionPoolManager(session)
+            fb_collector = FacebookCollector(pool_mgr)
+            try:
+                profile_meta, posts = await _fetch_facebook_profile_and_posts(
+                    fb_collector,
+                    fb_username,
+                    count=max(5, post_index),
+                )
+            except ScraperError as s_err:
+                return web.json_response(
+                    {"error": s_err.error_code, "message": s_err.message, "platform": "facebook"},
+                    status=s_err.status_code,
+                )
+            if not posts:
+                return web.json_response(
+                    {
+                        "error": f"Could not resolve recent posts for Facebook profile '{fb_username}'.",
+                        "hint": "Verify the Facebook profile/page exists and an active Facebook burner session is configured.",
+                    },
+                    status=404,
+                )
+            if post_index > len(posts):
+                return web.json_response(
+                    {
+                        "error": f"Requested post_index={post_index}, but Facebook profile '{fb_username}' only returned {len(posts)} posts.",
+                        "recent_posts": posts,
+                    },
+                    status=400,
+                )
+
+            selected = posts[post_index - 1]
+            platform = "facebook"
+            target_type = "post_url"
+            external_id = selected["shortcode"]
+            clean_url = selected["url"]
+            target_title = f"Facebook @{fb_username} ({external_id})"
+            resolved_post_meta = {
+                "username": f"@{fb_username}",
+                "post_index": post_index,
+                "shortcode": selected["shortcode"],
+                "url": selected["url"],
+                "caption": selected.get("caption"),
+                "published_at": selected.get("published_at"),
+                "comment_count": selected.get("comment_count", 0),
+                "like_count": selected.get("like_count", 0),
+            }
+            profile_recent_preview = [
+                {
+                    "post_index": p.get("post_index", i + 1),
+                    "shortcode": p["shortcode"],
+                    "url": p["url"],
+                    "comment_count": p.get("comment_count", 0),
+                    "like_count": p.get("like_count", 0),
+                    "published_at": p.get("published_at"),
+                    "caption": _truncate(p.get("caption"), 70),
+                }
+                for i, p in enumerate(posts[:5])
             ]
     elif ig_username:
         async with async_session_factory() as session:
