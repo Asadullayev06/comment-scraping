@@ -791,5 +791,134 @@ async def test_bridge_x_scrape_replies_and_explicit_errors(bridge_client, monkey
     assert yt_prof_data["comment_stats"]["total_stored"] == 2
     assert yt_prof_data["comment_stats"]["flagged_count"] == 2
 
+    # 8. Test X user replies endpoint (ops replies @handle -> /api/replies)
+    sample_replies_gql = {
+        "data": {
+            "user": {
+                "result": {
+                    "timeline_v2": {
+                        "timeline": {
+                            "instructions": [
+                                {
+                                    "type": "TimelineAddEntries",
+                                    "entries": [
+                                        {
+                                            "entryId": "profile-conversation-501",
+                                            "content": {
+                                                "items": [
+                                                    {
+                                                        "item": {
+                                                            "itemContent": {
+                                                                "tweet_results": {
+                                                                    "result": {
+                                                                        "__typename": "Tweet",
+                                                                        "rest_id": "500001",
+                                                                        "core": {
+                                                                            "user_results": {
+                                                                                "result": {
+                                                                                    "rest_id": "999999",
+                                                                                    "core": {
+                                                                                        "screen_name": "other_user",
+                                                                                        "name": "Other User",
+                                                                                    },
+                                                                                }
+                                                                            }
+                                                                        },
+                                                                        "legacy": {
+                                                                            "id_str": "500001",
+                                                                            "full_text": "Original post by someone else",
+                                                                            "created_at": "Wed Oct 28 14:00:00 +0000 2026",
+                                                                        },
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                    {
+                                                        "item": {
+                                                            "itemContent": {
+                                                                "tweet_results": {
+                                                                    "result": {
+                                                                        "__typename": "Tweet",
+                                                                        "rest_id": "500002",
+                                                                        "core": {
+                                                                            "user_results": {
+                                                                                "result": {
+                                                                                    "rest_id": "12345678",
+                                                                                    "core": {
+                                                                                        "screen_name": "AsliddinKamalov",
+                                                                                        "name": "Asliddin Kamalov",
+                                                                                    },
+                                                                                }
+                                                                            }
+                                                                        },
+                                                                        "legacy": {
+                                                                            "id_str": "500002",
+                                                                            "in_reply_to_status_id_str": "500001",
+                                                                            "in_reply_to_screen_name": "other_user",
+                                                                            "full_text": "These corrupt officials should be investigated for bribery immediately!",
+                                                                            "created_at": "Wed Oct 28 14:05:00 +0000 2026",
+                                                                            "reply_count": 1,
+                                                                        },
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                ]
+                                            },
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    }
+    parsed_user_replies = collector_inst._parse_user_replies_payload(
+        sample_replies_gql,
+        clean_username="AsliddinKamalov",
+        user_id="12345678",
+        count=10,
+    )
+    assert len(parsed_user_replies) == 1
+    assert parsed_user_replies[0].external_comment_id == "x_500002"
+    assert parsed_user_replies[0].author_username == "AsliddinKamalov"
+
+    async def mock_fetch_user_replies(self, username, count=20):
+        return (
+            {
+                "platform": "x",
+                "username": f"@{username.lstrip('@')}",
+                "url": f"https://x.com/{username.lstrip('@')}",
+                "full_name": "Asliddin Kamalov",
+                "bio": "Test bio",
+                "followers": 500,
+                "following": 100,
+                "total_posts": 120,
+                "is_verified": False,
+            },
+            parsed_user_replies[:count],
+        )
+
+    monkeypatch.setattr(TwitterXCollector, "fetch_user_replies", mock_fetch_user_replies)
+
+    rep_resp = await bridge_client.post(
+        "/api/replies",
+        json={"handle": "@AsliddinKamalov", "limit": 10},
+    )
+    assert rep_resp.status == 200
+    rep_data = await rep_resp.json()
+    assert rep_data["profile"]["platform"] == "x"
+    assert rep_data["profile"]["username"] == "@AsliddinKamalov"
+    assert rep_data["stats"]["total_replies"] == 1
+    assert rep_data["stats"]["evaluated"] == 1
+    assert rep_data["stats"]["flagged_count"] == 1
+    assert len(rep_data["replies"]) == 1
+    assert rep_data["replies"][0]["score"] == 8
+
+
 
 

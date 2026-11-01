@@ -168,12 +168,20 @@ def build_parser() -> argparse.ArgumentParser:
     # 3c. ops posts
     p_posts = sub.add_parser(
         "posts",
-        help="List an Instagram profile's recent posts with comment/like counts and shortcodes.",
+        help="List a profile's recent posts with comment/like counts and shortcodes.",
     )
-    p_posts.add_argument("handle", type=str, help="Instagram @handle or profile URL")
+    p_posts.add_argument("handle", type=str, help="Profile @handle or URL")
     p_posts.add_argument("--count", type=int, default=5, help="Number of recent posts to list (default: 5, max: 10)")
 
-    # 3d. ops untarget
+    # 3d. ops replies
+    p_replies = sub.add_parser(
+        "replies",
+        help="Fetch an X user's own recent replies (tweet_type='Replies') and score them via DeepSeek.",
+    )
+    p_replies.add_argument("handle", type=str, help="X @handle or profile URL (e.g. @username or https://x.com/username)")
+    p_replies.add_argument("--limit", "--count", dest="limit", type=int, default=20, help="Number of recent replies to fetch and evaluate (default: 20)")
+
+    # 3e. ops untarget
     p_untarget = sub.add_parser(
         "untarget",
         help="Deactivate or delete a monitored target by ID, shortcode, or handle.",
@@ -264,6 +272,13 @@ def main():
         res = api_request(
             "/api/posts",
             params={"target": args.handle, "count": args.count},
+        )
+    elif args.command == "replies":
+        res = api_request(
+            "/api/replies",
+            method="POST",
+            body={"handle": args.handle, "limit": args.limit},
+            timeout=180,
         )
     elif args.command == "untarget":
         res = api_request(
