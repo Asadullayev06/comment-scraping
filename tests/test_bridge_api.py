@@ -287,6 +287,8 @@ async def test_bridge_x_409_and_detailed_health(bridge_client):
     assert h_resp.status == 200
     h_data = await h_resp.json()
     assert h_data["status"] == "ok"
+    assert "commit" in h_data
+    assert len(h_data["commit"]) >= 7
     assert h_data["platforms_ready"]["instagram"] is True
     assert h_data["platforms_ready"]["x"] is False
 

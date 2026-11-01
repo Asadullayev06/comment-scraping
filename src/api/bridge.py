@@ -453,11 +453,20 @@ async def auth_middleware(request: web.Request, handler):
         return web.json_response({"error": str(exc)}, status=500)
 
 
+from src.version import get_git_commit
+
+
 async def handle_health(request: web.Request) -> web.Response:
     """GET /health"""
     mtproto = request.app.get("mtproto")
     mt_connected = bool(mtproto and mtproto.client and mtproto.client.is_connected())
-    return web.json_response({"status": "ok", "mtproto_connected": mt_connected})
+    return web.json_response(
+        {
+            "status": "ok",
+            "commit": get_git_commit(),
+            "mtproto_connected": mt_connected,
+        }
+    )
 
 
 async def handle_health_detailed(request: web.Request) -> web.Response:
@@ -490,6 +499,7 @@ async def handle_health_detailed(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "status": "ok",
+            "commit": get_git_commit(),
             "database": "connected",
             "mtproto_connected": mt_connected,
             "counts": {
