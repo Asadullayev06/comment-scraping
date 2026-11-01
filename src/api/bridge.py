@@ -1787,6 +1787,22 @@ async def handle_replies(request: web.Request) -> web.Response:
                 {"error": s_err.error_code, "message": s_err.message, "platform": "x"},
                 status=s_err.status_code,
             )
+        except Exception as err:
+            return web.json_response(
+                {"error": "replies fetch failed", "message": f"Failed to fetch replies for @{x_username}: {err}", "platform": "x"},
+                status=502,
+            )
+
+        if not norm_replies:
+            return web.json_response(
+                {
+                    "error": "no replies found",
+                    "message": f"No recent replies found for @{x_username}.",
+                    "platform": "x",
+                    "profile": profile_meta,
+                },
+                status=404,
+            )
 
         t_repo = TargetRepository(session)
         target = await t_repo.create_or_activate(

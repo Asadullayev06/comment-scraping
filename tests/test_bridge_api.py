@@ -919,6 +919,42 @@ async def test_bridge_x_scrape_replies_and_explicit_errors(bridge_client, monkey
     assert len(rep_data["replies"]) == 1
     assert rep_data["replies"][0]["score"] == 8
 
+    # Verify TweetType enum definition and export
+    from src.collectors.twitter_x import TweetType
+    assert TweetType.Replies == "Replies"
+    assert TweetType.Tweets == "Tweets"
+    assert TweetType.Media == "Media"
+    assert TweetType.Likes == "Likes"
+
+    # Verify that zero retrievable replies returns an explicit HTTP 404 error instead of total_replies: 0 silently
+    async def mock_fetch_zero_replies(self, username, count=20):
+        return (
+            {
+                "platform": "x",
+                "username": f"@{username.lstrip('@')}",
+                "url": f"https://x.com/{username.lstrip('@')}",
+                "full_name": "Zero User",
+                "bio": None,
+                "followers": 10,
+                "following": 5,
+                "total_posts": 0,
+                "is_verified": False,
+            },
+            [],
+        )
+
+    monkeypatch.setattr(TwitterXCollector, "fetch_user_replies", mock_fetch_zero_replies)
+
+    rep_zero_resp = await bridge_client.post(
+        "/api/replies",
+        json={"handle": "@ZeroUser", "limit": 10},
+    )
+    assert rep_zero_resp.status == 404
+    rep_zero_data = await rep_zero_resp.json()
+    assert rep_zero_data["error"] == "no replies found"
+    assert "No recent replies found for @ZeroUser" in rep_zero_data["message"]
+    assert rep_zero_data["profile"]["username"] == "@ZeroUser"
+
 
 
 
