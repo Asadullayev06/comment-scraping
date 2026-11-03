@@ -1367,6 +1367,8 @@ async def test_bridge_video_no_transcript_is_ungrounded_and_surfaces_bot_block(b
     assert resp.status == 200
     data = await resp.json()
     assert data["grounded"] is False
+    assert data["analysis"]["summary_source"] == "metadata_only"
+    assert "[metadata only — not transcript-verified]" in data["analysis"]["summary"]
     assert data["analysis"]["key_moments"] == []
     assert data["analysis"]["claims_and_allegations"] == []
     assert data["transcript"]["playability_status"] == "LOGIN_REQUIRED"

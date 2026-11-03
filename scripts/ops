@@ -264,15 +264,21 @@ def build_parser() -> argparse.ArgumentParser:
     # 5. ops sessions
     p_sessions = sub.add_parser(
         "sessions",
-        help="Check burner account health, reset cooldowns, or add a new burner session.",
+        help="Check burner account health, reset cooldowns, or add a new burner session / proxy.",
     )
-    p_sessions.add_argument("--platform", type=str, default="", help="Optional platform filter (instagram, x, facebook)")
+    p_sessions.add_argument("--platform", type=str, default="", help="Optional platform filter (instagram, x, facebook, youtube)")
     p_sessions.add_argument("--reset", action="store_true", help="Reset all cooldown timers and reactivate accounts")
+    p_sessions.add_argument(
+        "--proxy",
+        type=str,
+        default=None,
+        help="Optional proxy URL (e.g. http://user:pass@host:port or socks5://...)",
+    )
     p_sessions.add_argument(
         "--add",
         nargs=3,
         metavar=("PLATFORM", "ACCOUNT", "COOKIES"),
-        help="Add a burner session: --add x my_burner '{\"auth_token\":\"...\",\"ct0\":\"...\"}'",
+        help="Add a burner session: --add x my_burner '{\"auth_token\":\"...\",\"ct0\":\"...\"}' (or --add youtube yt_proxy '{}' --proxy http://...)",
     )
 
     return parser
@@ -384,6 +390,7 @@ def main():
                     "platform": plat,
                     "account": acct,
                     "cookies": cooks,
+                    "proxy_url": args.proxy,
                     "reset": args.reset,
                 },
             )

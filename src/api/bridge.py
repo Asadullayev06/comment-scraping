@@ -1839,12 +1839,12 @@ async def handle_sessions(request: web.Request) -> web.Response:
     async with async_session_factory() as session:
         s_repo = SessionRepository(session)
         added_session = None
-        if add_account and raw_cookies and platform:
+        if add_account and platform and (raw_cookies is not None or proxy_url):
             import json as _json
             cookies_dict: Dict[str, Any] = {}
             if isinstance(raw_cookies, dict):
                 cookies_dict = raw_cookies
-            elif isinstance(raw_cookies, str):
+            elif isinstance(raw_cookies, str) and raw_cookies.strip():
                 raw_c = raw_cookies.strip()
                 if raw_c.startswith("{"):
                     try:
@@ -2227,7 +2227,11 @@ def _enforce_video_grounding(
             audience_reaction["source"] = "transcript-correlated"
 
     analysis["grounded"] = report["grounded"]
+    analysis["summary_source"] = "transcript" if report["grounded"] else "metadata_only"
     if not report["grounded"]:
+        summary_txt = str(analysis.get("summary") or "").strip()
+        if summary_txt and not summary_txt.startswith("[metadata only"):
+            analysis["summary"] = f"[metadata only — not transcript-verified] {summary_txt}"
         analysis["grounding_note"] = (
             "No transcript was retrieved. Video-content fields are limited to title/description/metadata; "
             "no timestamps, key moments, or claims are reported because none could be verified."
