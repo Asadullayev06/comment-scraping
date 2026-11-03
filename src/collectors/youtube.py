@@ -1003,16 +1003,26 @@ class YouTubeCollector(BaseCollector):
 
         cookies: Dict[str, str] = {}
         proxy_url: Optional[str] = None
+        session_user_agent: Optional[str] = None
         if self.pool_manager:
             try:
                 session_tuple = await self.pool_manager.acquire_session("youtube")
                 if session_tuple:
-                    _, s_cookies, s_proxy = session_tuple
+                    session_obj, s_cookies, s_proxy = session_tuple
                     if isinstance(s_cookies, dict):
-                        cookies = s_cookies
+                        cookies = {str(k): str(v) for k, v in s_cookies.items() if v is not None}
                     proxy_url = s_proxy
+                    session_user_agent = getattr(session_obj, "user_agent", None) or None
             except Exception as e:
                 logger.debug("Could not acquire YouTube session from pool", error=str(e))
+
+        # Keep every YouTube request on the same authenticated transport.  In
+        # particular, SAPISID/__Secure-3PSID cookies must accompany the player
+        # request; otherwise YouTube returns LOGIN_REQUIRED before captionTracks
+        # are generated, and the signed timedtext URL is either empty or denied.
+        session_headers = dict(YT_WEB_HEADERS)
+        if session_user_agent:
+            session_headers["User-Agent"] = session_user_agent
 
         video_meta: Dict[str, Any] = {
             "video_id": vid,
@@ -1081,7 +1091,15 @@ class YouTubeCollector(BaseCollector):
 
         # 2. Fetch watch page to extract visitorData + initial player response
         try:
-            watch_resp = await self.http_client.get(f"https://www.youtube.com/watch?v={vid}")
+            watch_transport = httpx.AsyncHTTPTransport(proxy=proxy_url) if proxy_url else None
+            async with httpx.AsyncClient(
+                timeout=25.0,
+                follow_redirects=True,
+                headers=session_headers,
+                cookies=cookies,
+                transport=watch_transport,
+            ) as session_client:
+                watch_resp = await session_client.get(f"https://www.youtube.com/watch?v={vid}")
             if watch_resp.status_code == 200:
                 html_text = watch_resp.text
                 m_vis = re.search(r'"visitorData"\s*:\s*"([^"]+)"', html_text)
@@ -1169,7 +1187,13 @@ class YouTubeCollector(BaseCollector):
         ]
 
         transport = httpx.AsyncHTTPTransport(proxy=proxy_url) if proxy_url else None
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, transport=transport) as clean_client:
+        async with httpx.AsyncClient(
+            timeout=20.0,
+            follow_redirects=True,
+            transport=transport,
+            headers=session_headers,
+            cookies=cookies,
+        ) as clean_client:
             for c_label, c_ctx, c_ua in innertube_clients:
                 if caption_tracks:
                     break
