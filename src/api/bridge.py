@@ -2160,6 +2160,81 @@ def _extract_youtube_video_id(raw_input: str) -> Optional[str]:
     return None
 
 
+def _timestamp_to_seconds(raw: Any) -> Optional[int]:
+    """Parse a leading 'MM:SS' or 'HH:MM:SS' timestamp (optionally bracketed) into whole seconds."""
+    if raw is None:
+        return None
+    m = re.match(r"^\s*\[?\s*(\d{1,2}(?::\d{2}){1,2})", str(raw))
+    if not m:
+        return None
+    parts = [int(p) for p in m.group(1).split(":")]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return parts[0] * 60 + parts[1]
+
+
+def _enforce_video_grounding(
+    analysis: Dict[str, Any],
+    audience_reaction: Optional[Dict[str, Any]],
+    segments: List[Dict[str, Any]],
+    transcript_available: bool,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Strip any LLM-emitted timestamp that does not correspond to a real transcript segment.
+
+    - If no transcript: hard-force key_moments / claims_and_allegations / reactions_by_video_part to [].
+    - If transcript exists: keep only items whose timestamp matches a segment start (±1s).
+    """
+    report: Dict[str, Any] = {"grounded": bool(transcript_available and segments), "dropped_ungrounded_items": 0}
+
+    valid_secs: set = set()
+    for seg in segments or []:
+        try:
+            base = int(float(seg.get("start") or 0.0))
+        except (TypeError, ValueError):
+            continue
+        valid_secs.update({base - 1, base, base + 1})
+
+    def _is_grounded(ts_raw: Any) -> bool:
+        sec = _timestamp_to_seconds(ts_raw)
+        return sec is not None and sec in valid_secs
+
+    analysis = dict(analysis or {})
+    for key in ("key_moments", "claims_and_allegations"):
+        items = analysis.get(key) or []
+        if not isinstance(items, list):
+            items = []
+        if not report["grounded"]:
+            report["dropped_ungrounded_items"] += len(items)
+            analysis[key] = []
+        else:
+            kept = [it for it in items if isinstance(it, dict) and _is_grounded(it.get("timestamp"))]
+            report["dropped_ungrounded_items"] += len(items) - len(kept)
+            analysis[key] = kept
+
+    if isinstance(audience_reaction, dict):
+        audience_reaction = dict(audience_reaction)
+        parts = audience_reaction.get("reactions_by_video_part") or []
+        if not isinstance(parts, list):
+            parts = []
+        if not report["grounded"]:
+            report["dropped_ungrounded_items"] += len(parts)
+            audience_reaction["reactions_by_video_part"] = []
+            audience_reaction["source"] = "comment-derived, not transcript-correlated"
+        else:
+            kept_parts = [p for p in parts if isinstance(p, dict) and _is_grounded(p.get("video_part"))]
+            report["dropped_ungrounded_items"] += len(parts) - len(kept_parts)
+            audience_reaction["reactions_by_video_part"] = kept_parts
+            audience_reaction["source"] = "transcript-correlated"
+
+    analysis["grounded"] = report["grounded"]
+    if not report["grounded"]:
+        analysis["grounding_note"] = (
+            "No transcript was retrieved. Video-content fields are limited to title/description/metadata; "
+            "no timestamps, key moments, or claims are reported because none could be verified."
+        )
+    return analysis, audience_reaction, report
+
+
 async def handle_video(request: web.Request) -> web.Response:
     """GET/POST /api/video or /api/video/analyze — Analyze a YouTube video (Option 1: video content/transcript only; Option 2: video content + viewer comment reactions)."""
     body: Dict[str, Any] = {}
@@ -2251,11 +2326,14 @@ async def handle_video(request: web.Request) -> web.Response:
                 status=400,
             )
 
-        # Fetch video details, chapters, and transcript
-        video_bundle = await yt_collector.fetch_video_details_and_transcript(
-            video_id=video_id,
-            preferred_langs=preferred_langs,
-        )
+        # Fetch video details, chapters, and transcript (uses a YouTube burner session/proxy if one is configured)
+        async with async_session_factory() as yt_sess_db:
+            yt_collector.pool_manager = SessionPoolManager(yt_sess_db)
+            video_bundle = await yt_collector.fetch_video_details_and_transcript(
+                video_id=video_id,
+                preferred_langs=preferred_langs,
+            )
+            yt_collector.pool_manager = None
         video_meta = video_bundle["video"]
         transcript_info = video_bundle["transcript"]
 
@@ -2391,13 +2469,27 @@ async def handle_video(request: web.Request) -> web.Response:
         analysis_result = await classifier.analyze_video(llm_payload)
         audience_reaction = analysis_result.pop("audience_reaction", None)
 
+        # Hard grounding: drop every timestamp not present in transcript.segments
+        analysis_result, audience_reaction, grounding_report = _enforce_video_grounding(
+            analysis_result,
+            audience_reaction,
+            transcript_info.get("segments") or [],
+            bool(transcript_info.get("available")),
+        )
+
         response_data: Dict[str, Any] = {
             "status": "completed",
             "mode": effective_mode,
             "focus": focus,
+            "grounded": grounding_report["grounded"],
+            "grounding": grounding_report,
             "video": video_meta,
             "transcript": {
                 "available": transcript_info["available"],
+                "extraction_engine": transcript_info.get("extraction_engine"),
+                "playability_status": transcript_info.get("playability_status"),
+                "playability_reason": transcript_info.get("playability_reason"),
+                "unavailable_reason": transcript_info.get("unavailable_reason"),
                 "language": transcript_info["language"],
                 "language_name": transcript_info["language_name"],
                 "is_auto_generated": transcript_info["is_auto_generated"],

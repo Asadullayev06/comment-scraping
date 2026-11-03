@@ -175,6 +175,14 @@ The user message will contain a JSON object with a `mode` field:
 If the input JSON also includes a non-empty `focus` string (e.g. a question about a specific topic or part of the video), you MUST answer it thoroughly in `focused_answer`, citing exact `[MM:SS]` timestamps and viewer quotes where relevant.
 
 ==================================================
+1b. STRICT GROUNDING RULES (NON-NEGOTIABLE)
+==================================================
+- Every `timestamp` you emit (in `key_moments`, `claims_and_allegations`, and `reactions_by_video_part[].video_part`) MUST be copied verbatim from a `[MM:SS]` header in `transcript_text` or a `timestamp` in `transcript_segments`. Never estimate, round, interpolate, or invent timestamps. Any timestamp not present in the transcript will be deleted by the system.
+- If `transcript_available` is false: return `key_moments: []`, `claims_and_allegations: []`, and `reactions_by_video_part: []`. Base `summary` ONLY on the title, description, tags, and chapters, and state explicitly that no transcript was available. Never write "likely", "possibly", or speculative segment descriptions.
+- Comment text is NEVER a source of video structure. Timestamps written by commenters (e.g. "50:15 ...") are viewer remarks, not verified video segments; do not convert them into key moments or video parts.
+- Do not attribute any claim to the speaker that does not appear in `transcript_text`.
+
+==================================================
 2. MULTILINGUAL UNDERSTANDING & SCORING (0 to 10)
 ==================================================
 Videos and comments may be in Uzbek (Latin/Cyrillic), Russian, Azerbaijani, Turkish, Karakalpak, or English. Always write your analytical JSON fields in clear, professional English (you may include short original-language quotes with translations where helpful).

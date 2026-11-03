@@ -3,6 +3,10 @@
 import re
 import json
 import html
+import os
+import glob
+import tempfile
+import asyncio
 import xml.etree.ElementTree as ET
 from typing import AsyncIterator, Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone
@@ -112,6 +116,49 @@ def parse_youtube_timedtext(raw_content: str) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
+    # 1.5. Try WebVTT format if response starts with 'WEBVTT'
+    if text_stripped.startswith("WEBVTT"):
+        lines = text_stripped.splitlines()
+        idx = 0
+        while idx < len(lines):
+            line = lines[idx].strip()
+            m_vtt = re.match(
+                r"^(\d{1,2}:)?(\d{2}):(\d{2})[\.,](\d{3})\s*-->\s*(\d{1,2}:)?(\d{2}):(\d{2})[\.,](\d{3})",
+                line,
+            )
+            if m_vtt:
+                h1 = int((m_vtt.group(1) or "0:").rstrip(":"))
+                m1 = int(m_vtt.group(2))
+                s1 = int(m_vtt.group(3))
+                ms1 = int(m_vtt.group(4))
+                h2 = int((m_vtt.group(5) or "0:").rstrip(":"))
+                m2 = int(m_vtt.group(6))
+                s2 = int(m_vtt.group(7))
+                ms2 = int(m_vtt.group(8))
+                start_sec = round(h1 * 3600 + m1 * 60 + s1 + ms1 / 1000.0, 1)
+                end_sec = round(h2 * 3600 + m2 * 60 + s2 + ms2 / 1000.0, 1)
+                dur_sec = round(max(0.0, end_sec - start_sec), 1)
+                idx += 1
+                cue_lines = []
+                while idx < len(lines) and lines[idx].strip():
+                    cleaned_cue = re.sub(r"<[^>]+>", "", lines[idx]).strip()
+                    if cleaned_cue:
+                        cue_lines.append(cleaned_cue)
+                    idx += 1
+                clean_txt = " ".join(html.unescape(" ".join(cue_lines)).split()).strip()
+                if clean_txt and (not segments or segments[-1]["text"] != clean_txt):
+                    segments.append(
+                        {
+                            "timestamp": format_seconds_to_timestamp(start_sec),
+                            "start": start_sec,
+                            "duration": dur_sec,
+                            "text": clean_txt,
+                        }
+                    )
+            else:
+                idx += 1
+        return segments
+
     # 2. Try XML format (<timedtext format="3"><p t="..." d="..."> or <transcript><text start="..." dur="...">)
     try:
         root = ET.fromstring(text_stripped)
@@ -205,8 +252,9 @@ def _find_continuation_tokens(obj: Any, out: List[str]) -> None:
 class YouTubeCollector(BaseCollector):
     platform = "youtube"
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, pool_manager: Optional[Any] = None):
         self.api_key = api_key if api_key is not None else settings.YOUTUBE_API_KEY
+        self.pool_manager = pool_manager
         self.http_client = httpx.AsyncClient(timeout=25.0, follow_redirects=True, headers=YT_WEB_HEADERS)
         self.last_focal_tweet_meta: Optional[Dict[str, Any]] = None
 
@@ -652,17 +700,319 @@ class YouTubeCollector(BaseCollector):
         _, posts = await self.fetch_profile_info_and_posts(username, count=count)
         return posts
 
+    async def _fetch_transcript_via_ytdlp(
+        self,
+        video_id: str,
+        langs: List[str],
+        cookies: Dict[str, str],
+        proxy_url: Optional[str],
+    ) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[str], bool, List[Dict[str, Any]], Optional[str]]:
+        """Run yt-dlp (--write-subs --write-auto-subs --sub-format json3 --skip-download) to extract transcript."""
+        def _sync_extract() -> Tuple[List[Dict[str, Any]], Optional[str], Optional[str], bool, List[Dict[str, Any]], Optional[str]]:
+            try:
+                import yt_dlp
+            except ImportError:
+                return [], None, None, False, [], "yt-dlp not installed"
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cookie_file = None
+                if cookies:
+                    cookie_file = os.path.join(tmpdir, "cookies.txt")
+                    with open(cookie_file, "w", encoding="utf-8") as cf:
+                        cf.write("# Netscape HTTP Cookie File\n")
+                        for k, v in cookies.items():
+                            if v:
+                                cf.write(f".youtube.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
+
+                # Order of language preferences plus fallback wildcard
+                sub_langs = list(dict.fromkeys(langs + ["en.*", "ru.*", "uz.*", "all"]))
+                ydl_opts: Dict[str, Any] = {
+                    "skip_download": True,
+                    "writesubtitles": True,
+                    "writeautomaticsub": True,
+                    "subtitleslangs": sub_langs[:6],
+                    "subtitlesformat": "json3/srv3/ttml/vtt/best",
+                    "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+                    "quiet": True,
+                    "no_warnings": True,
+                    "nocheckcertificate": True,
+                    "extractor_args": {
+                        "youtube": {
+                            "player_client": ["ios", "android_vr", "tv", "web_embedded", "mweb", "web"],
+                        }
+                    },
+                }
+                if cookie_file:
+                    ydl_opts["cookiefile"] = cookie_file
+                if proxy_url:
+                    ydl_opts["proxy"] = proxy_url
+
+                avail_langs: List[Dict[str, Any]] = []
+                last_err: Optional[str] = None
+
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                        if not isinstance(info, dict):
+                            return [], None, None, False, [], "yt-dlp returned empty info"
+
+                        manual_subs = info.get("subtitles") or {}
+                        auto_subs = info.get("automatic_captions") or {}
+
+                        for l_code, tracks in manual_subs.items():
+                            if tracks:
+                                avail_langs.append({"code": l_code, "name": l_code, "is_auto": False})
+                        for l_code, tracks in auto_subs.items():
+                            if tracks and not any(x["code"] == l_code and not x["is_auto"] for x in avail_langs):
+                                avail_langs.append({"code": l_code, "name": f"{l_code} (auto-generated)", "is_auto": True})
+
+                        # Pick best language track from manual_subs or auto_subs
+                        chosen_lang = None
+                        chosen_is_auto = False
+                        chosen_tracks = None
+
+                        for pref in langs:
+                            for l_code, t_list in manual_subs.items():
+                                if (l_code.lower() == pref or l_code.lower().startswith(f"{pref}-")) and t_list:
+                                    chosen_lang = l_code
+                                    chosen_is_auto = False
+                                    chosen_tracks = t_list
+                                    break
+                            if chosen_tracks:
+                                break
+                            for l_code, t_list in auto_subs.items():
+                                if (l_code.lower() == pref or l_code.lower().startswith(f"{pref}-")) and t_list:
+                                    chosen_lang = l_code
+                                    chosen_is_auto = True
+                                    chosen_tracks = t_list
+                                    break
+                            if chosen_tracks:
+                                break
+
+                        if not chosen_tracks:
+                            for l_code, t_list in manual_subs.items():
+                                if t_list:
+                                    chosen_lang = l_code
+                                    chosen_is_auto = False
+                                    chosen_tracks = t_list
+                                    break
+                        if not chosen_tracks:
+                            for l_code, t_list in auto_subs.items():
+                                if t_list and l_code != "live_chat":
+                                    chosen_lang = l_code
+                                    chosen_is_auto = True
+                                    chosen_tracks = t_list
+                                    break
+
+                        if chosen_tracks and chosen_lang:
+                            # Prefer json3 or srv3 or vtt track URL
+                            ext_priority = {"json3": 0, "srv3": 1, "srv2": 2, "srv1": 3, "vtt": 4, "ttml": 5}
+                            sorted_fmt = sorted(
+                                [t for t in chosen_tracks if isinstance(t, dict) and t.get("url")],
+                                key=lambda x: ext_priority.get(str(x.get("ext") or "").lower(), 99),
+                            )
+                            for fmt in sorted_fmt[:3]:
+                                track_url = fmt["url"]
+                                try:
+                                    with ydl.urlopen(track_url) as resp_stream:
+                                        raw_bytes = resp_stream.read()
+                                        raw_str = raw_bytes.decode("utf-8", errors="replace")
+                                        parsed_segs = parse_youtube_timedtext(raw_str)
+                                        if parsed_segs:
+                                            lang_label = f"{chosen_lang} (auto-generated)" if chosen_is_auto else chosen_lang
+                                            return parsed_segs, chosen_lang, lang_label, chosen_is_auto, avail_langs, None
+                                except Exception as dl_err:
+                                    last_err = str(dl_err)
+                except Exception as y_err:
+                    last_err = str(y_err)
+
+                return [], None, None, False, avail_langs, last_err
+
+        return await asyncio.to_thread(_sync_extract)
+
+    async def _fetch_transcript_via_playwright(
+        self,
+        video_id: str,
+        langs: List[str],
+        cookies: Dict[str, str],
+        proxy_url: Optional[str],
+    ) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[str], bool, List[Dict[str, Any]], Optional[str]]:
+        """Headless Chromium fallback: loads the YouTube watch page in a real browser context and fetches captionTracks."""
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            return [], None, None, False, [], "playwright not installed"
+
+        pw_cookies = []
+        for name, val in cookies.items():
+            if val:
+                pw_cookies.append(
+                    {
+                        "name": str(name),
+                        "value": str(val),
+                        "domain": ".youtube.com",
+                        "path": "/",
+                        "secure": True,
+                        "sameSite": "Lax",
+                    }
+                )
+        pw_cookies.append(
+            {
+                "name": "CONSENT",
+                "value": "YES+cb.20240101-17-p0.en+FX+999",
+                "domain": ".youtube.com",
+                "path": "/",
+                "secure": True,
+                "sameSite": "Lax",
+            }
+        )
+
+        proxy_cfg = {"server": proxy_url} if proxy_url else None
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    proxy=proxy_cfg,
+                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+                )
+                try:
+                    context = await browser.new_context(
+                        user_agent=YT_WEB_HEADERS["User-Agent"],
+                        locale="en-US",
+                    )
+                    await context.add_cookies(pw_cookies)
+                    page = await context.new_page()
+
+                    intercepted_timedtext: List[str] = []
+
+                    async def on_response(resp):
+                        if "/api/timedtext" in resp.url and resp.status == 200:
+                            try:
+                                txt = await resp.text()
+                                if txt and txt.strip():
+                                    intercepted_timedtext.append(txt)
+                            except Exception:
+                                pass
+
+                    page.on("response", on_response)
+                    await page.goto(
+                        f"https://www.youtube.com/watch?v={video_id}",
+                        wait_until="domcontentloaded",
+                        timeout=25000,
+                    )
+                    await page.wait_for_timeout(2000)
+
+                    pr_info = await page.evaluate(
+                        """() => {
+                            const pr = window.ytInitialPlayerResponse || {};
+                            const ps = pr.playabilityStatus || {};
+                            const tracks = (((pr.captions || {}).playerCaptionsTracklistRenderer || {}).captionTracks) || [];
+                            return {
+                                status: ps.status || null,
+                                reason: ps.reason || null,
+                                tracks: tracks
+                            };
+                        }"""
+                    )
+
+                    play_reason = pr_info.get("reason")
+                    tracks = pr_info.get("tracks") or []
+                    avail_langs: List[Dict[str, Any]] = []
+                    for tr in tracks:
+                        l_code = str(tr.get("languageCode") or "")
+                        name_obj = tr.get("name") or {}
+                        l_name = (
+                            name_obj.get("simpleText")
+                            or "".join(r.get("text", "") for r in (name_obj.get("runs") or []))
+                            or l_code
+                        )
+                        avail_langs.append({"code": l_code, "name": l_name, "is_auto": tr.get("kind") == "asr"})
+
+                    if tracks:
+                        def _rank(t: Dict[str, Any]) -> Tuple[int, int]:
+                            code = str(t.get("languageCode") or "").lower()
+                            base_c = code.split("-")[0]
+                            l_idx = 999
+                            for idx, pref in enumerate(langs):
+                                if code == pref or base_c == pref:
+                                    l_idx = idx
+                                    break
+                            return (l_idx, 1 if t.get("kind") == "asr" else 0)
+
+                        best = sorted(tracks, key=_rank)[0]
+                        burl = best.get("baseUrl")
+                        s_lang = best.get("languageCode")
+                        name_obj = best.get("name") or {}
+                        s_name = (
+                            name_obj.get("simpleText")
+                            or "".join(r.get("text", "") for r in (name_obj.get("runs") or []))
+                            or s_lang
+                        )
+                        s_auto = best.get("kind") == "asr"
+                        if burl:
+                            raw_sub = await page.evaluate(
+                                """async (url) => {
+                                    try {
+                                        const r = await fetch(url + '&fmt=json3', {credentials: 'include'});
+                                        const t = await r.text();
+                                        if (t && t.trim().length > 0) return t;
+                                        const r2 = await fetch(url, {credentials: 'include'});
+                                        return await r2.text();
+                                    } catch (e) {
+                                        return '';
+                                    }
+                                }""",
+                                burl,
+                            )
+                            segs = parse_youtube_timedtext(raw_sub or "")
+                            if segs:
+                                return segs, s_lang, s_name, s_auto, avail_langs, None
+
+                    # Click subtitle button in player if available to trigger network timedtext
+                    if not intercepted_timedtext:
+                        try:
+                            sub_btn = await page.query_selector("button.ytp-subtitles-button")
+                            if sub_btn:
+                                await sub_btn.click()
+                                await page.wait_for_timeout(1500)
+                        except Exception:
+                            pass
+
+                    for raw_tt in intercepted_timedtext:
+                        segs = parse_youtube_timedtext(raw_tt)
+                        if segs:
+                            return segs, "auto", "Auto-detected", True, avail_langs, None
+
+                    return [], None, None, False, avail_langs, play_reason
+                finally:
+                    await browser.close()
+        except Exception as pw_err:
+            return [], None, None, False, [], str(pw_err)
+
     async def fetch_video_details_and_transcript(
         self,
         video_id: str,
         preferred_langs: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Fetch comprehensive YouTube video metadata, chapters, and timestamped transcript via InnerTube ANDROID player & Data API v3."""
+        """Fetch comprehensive YouTube video metadata, chapters, and timestamped transcript via multi-engine waterfall."""
         vid = str(video_id).strip()
         if not vid:
             raise ScraperError("invalid video id", "Missing YouTube video ID", status_code=400)
 
         langs = [l.strip().lower() for l in (preferred_langs or ["uz", "ru", "en", "tr", "az", "kk"]) if l.strip()]
+
+        cookies: Dict[str, str] = {}
+        proxy_url: Optional[str] = None
+        if self.pool_manager:
+            try:
+                session_tuple = await self.pool_manager.acquire_session("youtube")
+                if session_tuple:
+                    _, s_cookies, s_proxy = session_tuple
+                    if isinstance(s_cookies, dict):
+                        cookies = s_cookies
+                    proxy_url = s_proxy
+            except Exception as e:
+                logger.debug("Could not acquire YouTube session from pool", error=str(e))
 
         video_meta: Dict[str, Any] = {
             "video_id": vid,
@@ -684,59 +1034,12 @@ class YouTubeCollector(BaseCollector):
 
         caption_tracks: List[Dict[str, Any]] = []
         found_video = False
+        playability_status: Optional[str] = None
+        playability_reason: Optional[str] = None
+        visitor_data: Optional[str] = None
+        extraction_engine: Optional[str] = None
 
-        # 1. InnerTube ANDROID player request (provides un-throttled captionTracks + full videoDetails)
-        try:
-            player_resp = await self.http_client.post(
-                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-                json={
-                    "context": {
-                        "client": {
-                            "clientName": "ANDROID",
-                            "clientVersion": "20.10.38",
-                            "androidSdkVersion": 34,
-                            "hl": "en",
-                            "gl": "US",
-                        }
-                    },
-                    "videoId": vid,
-                },
-                headers={"User-Agent": YT_ANDROID_UA},
-            )
-            if player_resp.status_code == 200:
-                pdata = player_resp.json() or {}
-                play_status = (pdata.get("playabilityStatus") or {}).get("status")
-                v_details = pdata.get("videoDetails") or {}
-                if v_details and v_details.get("videoId") == vid and play_status != "ERROR":
-                    found_video = True
-                    video_meta["title"] = v_details.get("title") or video_meta["title"]
-                    video_meta["channel_name"] = v_details.get("author") or video_meta["channel_name"]
-                    video_meta["channel_id"] = v_details.get("channelId") or video_meta["channel_id"]
-                    dur_sec = int(v_details.get("lengthSeconds") or 0)
-                    video_meta["duration_seconds"] = dur_sec
-                    video_meta["duration_formatted"] = format_seconds_to_timestamp(dur_sec)
-                    video_meta["view_count"] = int(v_details.get("viewCount") or 0)
-                    video_meta["description"] = v_details.get("shortDescription") or ""
-                    video_meta["tags"] = v_details.get("keywords") or []
-
-                micro = (pdata.get("microformat") or {}).get("playerMicroformatRenderer") or {}
-                if micro:
-                    video_meta["published_at"] = micro.get("publishDate") or micro.get("uploadDate") or video_meta["published_at"]
-                    video_meta["category"] = micro.get("category") or video_meta["category"]
-                    if not video_meta["description"]:
-                        desc_obj = micro.get("description") or {}
-                        video_meta["description"] = desc_obj.get("simpleText") or ""
-
-                caption_tracks = (
-                    (pdata.get("captions") or {})
-                    .get("playerCaptionsTracklistRenderer", {})
-                    .get("captionTracks")
-                    or []
-                )
-        except Exception as e:
-            logger.warning("InnerTube ANDROID player fetch failed", video_id=vid, error=str(e))
-
-        # 2. Enrich with official YouTube Data API v3 if API key is configured (adds exact likes, comment count, ISO publish date)
+        # 1. Enrich metadata first via official YouTube Data API v3 if API key is configured
         if self.api_key:
             try:
                 v_resp = await self.http_client.get(
@@ -776,133 +1079,324 @@ class YouTubeCollector(BaseCollector):
             except Exception as e:
                 logger.warning("YouTube Data API v3 video metadata lookup failed", video_id=vid, error=str(e))
 
-        # 3. Fallback to watch page HTML if neither succeeded or if caption_tracks is still empty
-        if not found_video or not caption_tracks:
-            try:
-                watch_resp = await self.http_client.get(f"https://www.youtube.com/watch?v={vid}")
-                if watch_resp.status_code == 200:
-                    html_text = watch_resp.text
-                    m_pr = re.search(r"var ytInitialPlayerResponse\s*=\s*(\{.*?\});", html_text)
-                    if m_pr:
-                        pr_data = json.loads(m_pr.group(1))
-                        play_st = (pr_data.get("playabilityStatus") or {}).get("status")
-                        vd = pr_data.get("videoDetails") or {}
-                        if vd and vd.get("videoId") == vid and play_st != "ERROR":
-                            found_video = True
-                            video_meta["title"] = video_meta["title"] or vd.get("title")
-                            video_meta["channel_name"] = video_meta["channel_name"] or vd.get("author")
-                            video_meta["channel_id"] = video_meta["channel_id"] or vd.get("channelId")
-                            if not video_meta["duration_seconds"]:
-                                d_sec = int(vd.get("lengthSeconds") or 0)
-                                video_meta["duration_seconds"] = d_sec
-                                video_meta["duration_formatted"] = format_seconds_to_timestamp(d_sec)
-                            if not video_meta["view_count"]:
-                                video_meta["view_count"] = int(vd.get("viewCount") or 0)
-                            if not video_meta["description"]:
-                                video_meta["description"] = vd.get("shortDescription") or ""
-                            if not video_meta["tags"]:
-                                video_meta["tags"] = vd.get("keywords") or []
-                        if not caption_tracks:
-                            caption_tracks = (
-                                (pr_data.get("captions") or {})
-                                .get("playerCaptionsTracklistRenderer", {})
-                                .get("captionTracks")
-                                or []
-                            )
-            except Exception as e:
-                logger.warning("YouTube watch HTML fallback failed", video_id=vid, error=str(e))
+        # 2. Fetch watch page to extract visitorData + initial player response
+        try:
+            watch_resp = await self.http_client.get(f"https://www.youtube.com/watch?v={vid}")
+            if watch_resp.status_code == 200:
+                html_text = watch_resp.text
+                m_vis = re.search(r'"visitorData"\s*:\s*"([^"]+)"', html_text)
+                if m_vis:
+                    visitor_data = m_vis.group(1)
 
-        if not found_video:
-            raise ScraperError("video not found", f"YouTube video '{vid}' not found or unavailable", status_code=404)
+                m_pr = re.search(r"var ytInitialPlayerResponse\s*=\s*(\{.*?\});", html_text)
+                if m_pr:
+                    pr_data = json.loads(m_pr.group(1))
+                    ps_obj = pr_data.get("playabilityStatus") or {}
+                    play_st = ps_obj.get("status")
+                    play_rsn = ps_obj.get("reason")
+                    if play_st:
+                        playability_status = play_st
+                    if play_rsn:
+                        playability_reason = play_rsn
 
-        video_meta["chapters"] = extract_chapters_from_description(video_meta.get("description"))
+                    vd = pr_data.get("videoDetails") or {}
+                    if vd and vd.get("videoId") == vid and play_st != "ERROR":
+                        found_video = True
+                        video_meta["title"] = video_meta["title"] or vd.get("title")
+                        video_meta["channel_name"] = video_meta["channel_name"] or vd.get("author")
+                        video_meta["channel_id"] = video_meta["channel_id"] or vd.get("channelId")
+                        if not video_meta["duration_seconds"]:
+                            d_sec = int(vd.get("lengthSeconds") or 0)
+                            video_meta["duration_seconds"] = d_sec
+                            video_meta["duration_formatted"] = format_seconds_to_timestamp(d_sec)
+                        if not video_meta["view_count"]:
+                            video_meta["view_count"] = int(vd.get("viewCount") or 0)
+                        if not video_meta["description"]:
+                            video_meta["description"] = vd.get("shortDescription") or ""
+                        if not video_meta["tags"]:
+                            video_meta["tags"] = vd.get("keywords") or []
 
-        # 4. Select best caption track and fetch transcript
-        available_languages: List[Dict[str, Any]] = []
-        for tr in caption_tracks:
-            l_code = str(tr.get("languageCode") or "")
-            name_obj = tr.get("name") or {}
-            l_name = name_obj.get("simpleText") or "".join(r.get("text", "") for r in (name_obj.get("runs") or [])) or l_code
-            is_auto = tr.get("kind") == "asr"
-            available_languages.append(
+                    web_tracks = (
+                        (pr_data.get("captions") or {})
+                        .get("playerCaptionsTracklistRenderer", {})
+                        .get("captionTracks")
+                        or []
+                    )
+                    if web_tracks:
+                        caption_tracks = web_tracks
+                        extraction_engine = "watch_html"
+        except Exception as e:
+            logger.warning("YouTube watch HTML fetch failed", video_id=vid, error=str(e))
+
+        # 3. InnerTube Multi-Client Player Waterfall (using isolated cookie-free client + visitorData so ANDROID/IOS never 400s)
+        innertube_clients = [
+            (
+                "ANDROID",
                 {
-                    "code": l_code,
-                    "name": l_name,
-                    "is_auto": is_auto,
-                }
+                    "clientName": "ANDROID",
+                    "clientVersion": "20.10.38",
+                    "androidSdkVersion": 34,
+                    "hl": "en",
+                    "gl": "US",
+                },
+                YT_ANDROID_UA,
+            ),
+            (
+                "IOS",
+                {
+                    "clientName": "IOS",
+                    "clientVersion": "19.45.4",
+                    "deviceMake": "Apple",
+                    "deviceModel": "iPhone16,2",
+                    "osName": "iPhone",
+                    "osVersion": "18.1.0.22B83",
+                    "hl": "en",
+                    "gl": "US",
+                },
+                "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)",
+            ),
+            (
+                "ANDROID_VR",
+                {
+                    "clientName": "ANDROID_VR",
+                    "clientVersion": "1.60.19",
+                    "androidSdkVersion": 32,
+                    "hl": "en",
+                    "gl": "US",
+                },
+                "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+            ),
+        ]
+
+        transport = httpx.AsyncHTTPTransport(proxy=proxy_url) if proxy_url else None
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, transport=transport) as clean_client:
+            for c_label, c_ctx, c_ua in innertube_clients:
+                if caption_tracks:
+                    break
+                try:
+                    client_payload = dict(c_ctx)
+                    if visitor_data:
+                        client_payload["visitorData"] = visitor_data
+                    req_headers = {
+                        "User-Agent": c_ua,
+                        "Content-Type": "application/json",
+                        "Accept-Language": "en-US,en;q=0.9",
+                    }
+                    if visitor_data:
+                        req_headers["X-Goog-Visitor-Id"] = visitor_data
+
+                    player_resp = await clean_client.post(
+                        "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                        json={
+                            "context": {"client": client_payload},
+                            "videoId": vid,
+                            "contentCheckOk": True,
+                            "racyCheckOk": True,
+                        },
+                        headers=req_headers,
+                    )
+                    if player_resp.status_code == 200:
+                        pdata = player_resp.json() or {}
+                        ps_obj = pdata.get("playabilityStatus") or {}
+                        play_st = ps_obj.get("status")
+                        play_rsn = ps_obj.get("reason")
+                        if play_st and (not playability_status or play_st == "OK"):
+                            playability_status = play_st
+                            if play_st == "OK":
+                                playability_reason = None
+                        if play_rsn and playability_status != "OK":
+                            playability_reason = play_rsn
+
+                        v_details = pdata.get("videoDetails") or {}
+                        if v_details and v_details.get("videoId") == vid and play_st != "ERROR":
+                            found_video = True
+                            video_meta["title"] = video_meta["title"] or v_details.get("title")
+                            video_meta["channel_name"] = video_meta["channel_name"] or v_details.get("author")
+                            video_meta["channel_id"] = video_meta["channel_id"] or v_details.get("channelId")
+                            if not video_meta["duration_seconds"]:
+                                dur_sec = int(v_details.get("lengthSeconds") or 0)
+                                video_meta["duration_seconds"] = dur_sec
+                                video_meta["duration_formatted"] = format_seconds_to_timestamp(dur_sec)
+                            if not video_meta["view_count"]:
+                                video_meta["view_count"] = int(v_details.get("viewCount") or 0)
+                            if not video_meta["description"]:
+                                video_meta["description"] = v_details.get("shortDescription") or ""
+                            if not video_meta["tags"]:
+                                video_meta["tags"] = v_details.get("keywords") or []
+
+                        micro = (pdata.get("microformat") or {}).get("playerMicroformatRenderer") or {}
+                        if micro:
+                            video_meta["published_at"] = (
+                                video_meta["published_at"] or micro.get("publishDate") or micro.get("uploadDate")
+                            )
+                            video_meta["category"] = video_meta["category"] or micro.get("category")
+
+                        tracks = (
+                            (pdata.get("captions") or {})
+                            .get("playerCaptionsTracklistRenderer", {})
+                            .get("captionTracks")
+                            or []
+                        )
+                        if tracks:
+                            caption_tracks = tracks
+                            extraction_engine = f"innertube_{c_label.lower()}"
+                            break
+                except Exception as e:
+                    logger.debug("InnerTube client attempt failed", client=c_label, video_id=vid, error=str(e))
+
+            if not found_video:
+                raise ScraperError("video not found", f"YouTube video '{vid}' not found or unavailable", status_code=404)
+
+            video_meta["chapters"] = extract_chapters_from_description(video_meta.get("description"))
+
+            # 4. Select best caption track from InnerTube if available
+            available_languages: List[Dict[str, Any]] = []
+            for tr in caption_tracks:
+                l_code = str(tr.get("languageCode") or "")
+                name_obj = tr.get("name") or {}
+                l_name = (
+                    name_obj.get("simpleText")
+                    or "".join(r.get("text", "") for r in (name_obj.get("runs") or []))
+                    or l_code
+                )
+                is_auto = tr.get("kind") == "asr"
+                available_languages.append({"code": l_code, "name": l_name, "is_auto": is_auto})
+
+            segments: List[Dict[str, Any]] = []
+            selected_lang: Optional[str] = None
+            selected_lang_name: Optional[str] = None
+            selected_is_auto = False
+
+            if caption_tracks:
+                def _track_rank(t: Dict[str, Any]) -> Tuple[int, int]:
+                    code = str(t.get("languageCode") or "").lower()
+                    base_code = code.split("-")[0]
+                    lang_idx = 999
+                    for idx, pref in enumerate(langs):
+                        if code == pref or base_code == pref:
+                            lang_idx = idx
+                            break
+                    is_asr = 1 if t.get("kind") == "asr" else 0
+                    return (lang_idx, is_asr)
+
+                selected_track = sorted(caption_tracks, key=_track_rank)[0]
+                if selected_track and selected_track.get("baseUrl"):
+                    base_url = selected_track["baseUrl"]
+                    selected_lang = selected_track.get("languageCode")
+                    name_obj = selected_track.get("name") or {}
+                    selected_lang_name = (
+                        name_obj.get("simpleText")
+                        or "".join(r.get("text", "") for r in (name_obj.get("runs") or []))
+                        or selected_lang
+                    )
+                    selected_is_auto = selected_track.get("kind") == "asr"
+
+                    dl_headers = {"User-Agent": YT_ANDROID_UA}
+                    if visitor_data:
+                        dl_headers["X-Goog-Visitor-Id"] = visitor_data
+                    try:
+                        t_resp = await clean_client.get(base_url, headers=dl_headers)
+                        if t_resp.status_code == 200 and t_resp.text.strip():
+                            segments = parse_youtube_timedtext(t_resp.text)
+                        if not segments:
+                            t_resp_j = await clean_client.get(f"{base_url}&fmt=json3", headers=dl_headers)
+                            if t_resp_j.status_code == 200 and t_resp_j.text.strip():
+                                segments = parse_youtube_timedtext(t_resp_j.text)
+                    except Exception as e:
+                        logger.warning("Failed to download YouTube caption track", video_id=vid, error=str(e))
+
+        # 5. Fallback Engine A: yt-dlp (--write-subs --write-auto-subs --sub-format json3 --skip-download)
+        if not segments:
+            ytdlp_segs, ytdlp_lang, ytdlp_name, ytdlp_auto, ytdlp_avail, ytdlp_err = await self._fetch_transcript_via_ytdlp(
+                video_id=vid,
+                langs=langs,
+                cookies=cookies,
+                proxy_url=proxy_url,
             )
+            if ytdlp_avail and not available_languages:
+                available_languages = ytdlp_avail
+            if ytdlp_segs:
+                segments = ytdlp_segs
+                selected_lang = ytdlp_lang
+                selected_lang_name = ytdlp_name
+                selected_is_auto = ytdlp_auto
+                extraction_engine = "yt_dlp"
+                playability_status = "OK"
+                playability_reason = None
+            elif ytdlp_err and not playability_reason and ("bot" in ytdlp_err.lower() or "sign in" in ytdlp_err.lower()):
+                playability_status = playability_status or "LOGIN_REQUIRED"
+                playability_reason = ytdlp_err
 
-        selected_track: Optional[Dict[str, Any]] = None
-        if caption_tracks:
-            # Score each track by preferred language order + manual over ASR
-            def _track_rank(t: Dict[str, Any]) -> Tuple[int, int]:
-                code = str(t.get("languageCode") or "").lower()
-                base_code = code.split("-")[0]
-                lang_idx = 999
-                for idx, pref in enumerate(langs):
-                    if code == pref or base_code == pref:
-                        lang_idx = idx
-                        break
-                is_asr = 1 if t.get("kind") == "asr" else 0
-                return (lang_idx, is_asr)
-
-            sorted_tracks = sorted(caption_tracks, key=_track_rank)
-            selected_track = sorted_tracks[0]
-
-        segments: List[Dict[str, Any]] = []
-        selected_lang = None
-        selected_lang_name = None
-        selected_is_auto = False
-
-        if selected_track and selected_track.get("baseUrl"):
-            base_url = selected_track["baseUrl"]
-            selected_lang = selected_track.get("languageCode")
-            name_obj = selected_track.get("name") or {}
-            selected_lang_name = (
-                name_obj.get("simpleText")
-                or "".join(r.get("text", "") for r in (name_obj.get("runs") or []))
-                or selected_lang
+        # 6. Fallback Engine B: Playwright headless Chromium (executes BotGuard JS / poToken in real browser)
+        if not segments:
+            pw_segs, pw_lang, pw_name, pw_auto, pw_avail, pw_rsn = await self._fetch_transcript_via_playwright(
+                video_id=vid,
+                langs=langs,
+                cookies=cookies,
+                proxy_url=proxy_url,
             )
-            selected_is_auto = selected_track.get("kind") == "asr"
+            if pw_avail and not available_languages:
+                available_languages = pw_avail
+            if pw_segs:
+                segments = pw_segs
+                selected_lang = pw_lang
+                selected_lang_name = pw_name
+                selected_is_auto = pw_auto
+                extraction_engine = "playwright"
+                playability_status = "OK"
+                playability_reason = None
+            elif pw_rsn and not playability_reason:
+                playability_reason = pw_rsn
 
-            try:
-                t_resp = await self.http_client.get(base_url, headers={"User-Agent": YT_ANDROID_UA})
-                if t_resp.status_code == 200 and t_resp.text.strip():
-                    segments = parse_youtube_timedtext(t_resp.text)
-                if not segments:
-                    t_resp_j = await self.http_client.get(f"{base_url}&fmt=json3", headers={"User-Agent": YT_ANDROID_UA})
-                    if t_resp_j.status_code == 200 and t_resp_j.text.strip():
-                        segments = parse_youtube_timedtext(t_resp_j.text)
-            except Exception as e:
-                logger.warning("Failed to download YouTube caption track", video_id=vid, error=str(e))
-
-        # Group segments into ~20-second blocks for a clean, readable timestamped transcript
+        # Group segments into ~20-second blocks where each block's header [MM:SS] matches an exact segment timestamp
         grouped_lines: List[str] = []
         bucket_start: Optional[float] = None
+        bucket_ts_str: Optional[str] = None
         bucket_texts: List[str] = []
         for seg in segments:
             s_time = float(seg.get("start") or 0.0)
+            s_ts = seg.get("timestamp") or format_seconds_to_timestamp(s_time)
             s_txt = seg.get("text") or ""
             if not s_txt:
                 continue
             if bucket_start is None:
                 bucket_start = s_time
+                bucket_ts_str = s_ts
                 bucket_texts = [s_txt]
             elif s_time - bucket_start >= 20.0:
-                grouped_lines.append(f"[{format_seconds_to_timestamp(bucket_start)}] {' '.join(bucket_texts)}")
+                grouped_lines.append(f"[{bucket_ts_str}] {' '.join(bucket_texts)}")
                 bucket_start = s_time
+                bucket_ts_str = s_ts
                 bucket_texts = [s_txt]
             else:
                 bucket_texts.append(s_txt)
-        if bucket_start is not None and bucket_texts:
-            grouped_lines.append(f"[{format_seconds_to_timestamp(bucket_start)}] {' '.join(bucket_texts)}")
+        if bucket_start is not None and bucket_ts_str and bucket_texts:
+            grouped_lines.append(f"[{bucket_ts_str}] {' '.join(bucket_texts)}")
 
         full_transcript_text = "\n".join(grouped_lines)
+
+        unavailable_reason: Optional[str] = None
+        if not segments:
+            if playability_status in ("LOGIN_REQUIRED", "UNPLAYABLE") or (
+                playability_reason and ("bot" in playability_reason.lower() or "sign in" in playability_reason.lower())
+            ):
+                unavailable_reason = (
+                    f"YouTube bot-check blocked anonymous transcript extraction "
+                    f"(playabilityStatus={playability_status or 'LOGIN_REQUIRED'}: "
+                    f"{playability_reason or 'Sign in to confirm you are not a bot'}). "
+                    f"Add a YouTube session or proxy via 'ops sessions --add youtube <account> <cookies_json>'."
+                )
+            else:
+                unavailable_reason = "Video is playable but has no manual or auto-generated caption tracks."
 
         return {
             "video": video_meta,
             "transcript": {
                 "available": len(segments) > 0,
+                "extraction_engine": extraction_engine if segments else None,
+                "playability_status": "OK" if segments else (playability_status or "OK"),
+                "playability_reason": None if segments else playability_reason,
+                "unavailable_reason": unavailable_reason,
                 "language": selected_lang,
                 "language_name": selected_lang_name,
                 "is_auto_generated": selected_is_auto,

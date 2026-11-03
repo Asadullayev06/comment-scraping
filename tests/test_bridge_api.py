@@ -1277,6 +1277,111 @@ async def test_bridge_youtube_video_analysis_option1_and_option2(bridge_client, 
     assert data2["comment_stats"]["flagged_count"] == 1
     assert len(data2["flagged_comments"]) == 1
     assert "@viewer_one" in data2["flagged_comments"][0]["author"]
+    assert data2["grounded"] is True
+    assert data2["audience_reaction"]["source"] == "transcript-correlated"
+
+
+def test_enforce_video_grounding_drops_fabricated_timestamps():
+    """Timestamps not present in transcript.segments must be removed; with no transcript everything is forced empty."""
+    from src.api.bridge import _enforce_video_grounding
+
+    segments = [
+        {"timestamp": "00:00", "start": 0.0, "duration": 4.5, "text": "Kirish"},
+        {"timestamp": "02:00", "start": 120.4, "duration": 5.0, "text": "Soliq"},
+    ]
+    analysis = {
+        "summary": "x",
+        "key_moments": [
+            {"timestamp": "00:00", "topic": "Intro", "summary": "real"},
+            {"timestamp": "50:15", "topic": "Religious debate", "summary": "lifted from a comment"},
+            {"timestamp": "02:00", "topic": "Tax", "summary": "real"},
+        ],
+        "claims_and_allegations": [
+            {"timestamp": "01:10:00", "claim": "invented", "severity_score": 8},
+            {"timestamp": "[02:01]", "claim": "real within 1s", "severity_score": 5},
+        ],
+    }
+    reaction = {
+        "overall_sentiment": "hostile",
+        "reactions_by_video_part": [
+            {"video_part": "02:00 - Tax segment", "viewer_reaction": "angry"},
+            {"video_part": "15:00 - Critique of government", "viewer_reaction": "invented"},
+        ],
+    }
+
+    a, r, rep = _enforce_video_grounding(analysis, reaction, segments, True)
+    assert rep["grounded"] is True
+    assert [k["timestamp"] for k in a["key_moments"]] == ["00:00", "02:00"]
+    assert len(a["claims_and_allegations"]) == 1
+    assert len(r["reactions_by_video_part"]) == 1
+    assert rep["dropped_ungrounded_items"] == 3
+
+    # No transcript -> hard-force empty and label as comment-derived
+    a2, r2, rep2 = _enforce_video_grounding(analysis, reaction, [], False)
+    assert rep2["grounded"] is False
+    assert a2["grounded"] is False
+    assert a2["key_moments"] == []
+    assert a2["claims_and_allegations"] == []
+    assert r2["reactions_by_video_part"] == []
+    assert r2["source"] == "comment-derived, not transcript-correlated"
+    assert "grounding_note" in a2
+
+
+@pytest.mark.asyncio
+async def test_bridge_video_no_transcript_is_ungrounded_and_surfaces_bot_block(bridge_client, monkeypatch):
+    """When YouTube bot-blocks transcript extraction, the reason is surfaced and no timestamps are emitted."""
+    from src.collectors.youtube import YouTubeCollector
+    from src.llm.client import DeepSeekClassifier
+
+    async def mock_fetch(self, video_id: str, preferred_langs=None):
+        return {
+            "video": {
+                "video_id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}",
+                "title": "Siyosiy suhbat", "channel_name": "Kanal", "channel_id": "UC1",
+                "published_at": "2026-10-31T11:06:06Z", "duration_seconds": 6290, "duration_formatted": "01:44:50",
+                "view_count": 78947, "like_count": 1527, "comment_count": 196,
+                "description": "", "tags": [], "category": None, "chapters": [],
+            },
+            "transcript": {
+                "available": False, "extraction_engine": None,
+                "playability_status": "LOGIN_REQUIRED",
+                "playability_reason": "Sign in to confirm you're not a bot",
+                "unavailable_reason": "YouTube bot-check blocked anonymous transcript extraction",
+                "language": None, "language_name": None, "is_auto_generated": False,
+                "available_languages": [], "segment_count": 0, "full_text": "", "segments": [],
+            },
+        }
+
+    async def fabricating_llm(self, payload, max_retries=3):
+        return {
+            "summary": "likely a political talk",
+            "key_moments": [{"timestamp": "15:00", "topic": "Critique", "summary": "possibly"}],
+            "claims_and_allegations": [{"timestamp": "30:00", "claim": "invented", "severity_score": 7}],
+            "audience_reaction": None,
+        }
+
+    monkeypatch.setattr(YouTubeCollector, "fetch_video_details_and_transcript", mock_fetch)
+    monkeypatch.setattr(DeepSeekClassifier, "analyze_video", fabricating_llm)
+
+    resp = await bridge_client.post("/api/video", json={"url": "https://youtu.be/aircAruvnKk", "mode": "video"})
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["grounded"] is False
+    assert data["analysis"]["key_moments"] == []
+    assert data["analysis"]["claims_and_allegations"] == []
+    assert data["transcript"]["playability_status"] == "LOGIN_REQUIRED"
+    assert "not a bot" in data["transcript"]["playability_reason"]
+    assert data["grounding"]["dropped_ungrounded_items"] == 2
+
+
+def test_parse_youtube_timedtext_vtt():
+    from src.collectors.youtube import parse_youtube_timedtext
+
+    vtt = "WEBVTT\n\n00:00:01.200 --> 00:00:03.360\nHello <c>world</c>\n\n00:01:05.000 --> 00:01:07.500\nSecond cue\n"
+    segs = parse_youtube_timedtext(vtt)
+    assert len(segs) == 2
+    assert segs[0]["text"] == "Hello world"
+    assert segs[1]["timestamp"] == "01:05"
 
 
 
