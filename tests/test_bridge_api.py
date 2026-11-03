@@ -1144,5 +1144,141 @@ async def test_bridge_facebook_profile_and_scrape(bridge_client, monkeypatch):
     assert prof_scrape_data["posts"][0]["comment_count"] >= 1
 
 
+@pytest.mark.asyncio
+async def test_bridge_youtube_video_analysis_option1_and_option2(bridge_client, monkeypatch):
+    """Test /api/video for Option 1 (video-only transcript analysis) and Option 2 (video + audience reaction correlation)."""
+    from datetime import datetime, timezone
+    from src.collectors.youtube import (
+        YouTubeCollector,
+        parse_youtube_timedtext,
+        extract_chapters_from_description,
+        parse_iso8601_duration,
+    )
+    from src.schemas.comment import NormalizedComment
+
+    # Unit tests for timedtext & chapter helpers
+    sample_xml = """<?xml version="1.0" encoding="utf-8" ?><timedtext format="3">
+    <body>
+    <p t="0" d="4500">Bugun yangi soliq va jarima qoidalari haqida gaplashamiz.</p>
+    <p t="15000" d="5000">Elektr va gaz tariflari oshishi aholiga qanday ta'sir qiladi?</p>
+    </body></timedtext>"""
+    segs = parse_youtube_timedtext(sample_xml)
+    assert len(segs) == 2
+    assert segs[0]["timestamp"] == "00:00"
+    assert "soliq" in segs[0]["text"]
+    assert segs[1]["timestamp"] == "00:15"
+
+    chapters = extract_chapters_from_description("00:00 Kirish\n02:30 Soliq islohoti\n05:15 Tariflar")
+    assert len(chapters) == 3
+    assert chapters[1]["timestamp"] == "02:30"
+    assert chapters[1]["title"] == "Soliq islohoti"
+    assert parse_iso8601_duration("PT12M30S") == 750
+
+    async def mock_fetch_video_details_and_transcript(self, video_id: str, preferred_langs=None):
+        return {
+            "video": {
+                "video_id": video_id,
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "title": "Yangi soliq va kommunal tariflar tahlili",
+                "channel_name": "Tahlil TV",
+                "channel_id": "UC_test_123",
+                "published_at": "2026-11-01T10:00:00Z",
+                "duration_seconds": 360,
+                "duration_formatted": "06:00",
+                "view_count": 54000,
+                "like_count": 1200,
+                "comment_count": 320,
+                "description": "00:00 Kirish\n02:00 Soliq va jarimalar",
+                "tags": ["soliq", "tariflar", "iqtisod"],
+                "category": "News & Politics",
+                "chapters": [
+                    {"timestamp": "00:00", "start_seconds": 0, "title": "Kirish"},
+                    {"timestamp": "02:00", "start_seconds": 120, "title": "Soliq va jarimalar"},
+                ],
+            },
+            "transcript": {
+                "available": True,
+                "language": "uz",
+                "language_name": "Uzbek (auto-generated)",
+                "is_auto_generated": True,
+                "available_languages": [{"code": "uz", "name": "Uzbek", "is_auto": True}],
+                "segment_count": 2,
+                "full_text": "[00:00] Bugun yangi soliq va jarima qoidalari haqida gaplashamiz.\n[02:00] Elektr va gaz tariflari oshishi muhokama qilinadi.",
+                "segments": segs,
+            },
+        }
+
+    async def mock_fetch_comments(self, target, cursor=None, limit=100):
+        yield NormalizedComment(
+            platform="youtube",
+            external_comment_id="yt_comm_hostile_1",
+            parent_external_id=target.external_id,
+            target_external_id=target.external_id,
+            source_name="YouTube Tahlil TV",
+            post_url=f"https://www.youtube.com/watch?v={target.external_id}",
+            comment_url=f"https://www.youtube.com/watch?v={target.external_id}&lc=yt_comm_hostile_1",
+            author_external_id="u_yt_1",
+            author_username="viewer_one",
+            author_display_name="Viewer One",
+            content_text="Bu yeni vergi qanunu xalqı soyğun üçündür, rejim camaatı boğur, hamı etiraz etməlidir!",
+            published_at=datetime.now(timezone.utc),
+        )
+        yield NormalizedComment(
+            platform="youtube",
+            external_comment_id="yt_comm_benign_2",
+            parent_external_id=target.external_id,
+            target_external_id=target.external_id,
+            source_name="YouTube Tahlil TV",
+            post_url=f"https://www.youtube.com/watch?v={target.external_id}",
+            comment_url=f"https://www.youtube.com/watch?v={target.external_id}&lc=yt_comm_benign_2",
+            author_external_id="u_yt_2",
+            author_username="viewer_two",
+            author_display_name="Viewer Two",
+            content_text="Ma'lumot uchun rahmat, tushunarli video bo'libdi.",
+            published_at=datetime.now(timezone.utc),
+        )
+
+    monkeypatch.setattr(YouTubeCollector, "fetch_video_details_and_transcript", mock_fetch_video_details_and_transcript)
+    monkeypatch.setattr(YouTubeCollector, "fetch_comments", mock_fetch_comments)
+
+    # Option 1: Video-only analysis (mode="video")
+    resp1 = await bridge_client.post(
+        "/api/video",
+        json={"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "mode": "video"},
+    )
+    assert resp1.status == 200
+    data1 = await resp1.json()
+    assert data1["mode"] == "video"
+    assert data1["video"]["video_id"] == "dQw4w9WgXcQ"
+    assert data1["transcript"]["available"] is True
+    assert data1["transcript"]["language"] == "uz"
+    assert "summary" in data1["analysis"]
+    assert "key_moments" in data1["analysis"]
+    assert "audience_reaction" not in data1
+
+    # Option 2: Video + Viewer Reactions correlation (mode="reactions" / reactions=True)
+    resp2 = await bridge_client.post(
+        "/api/video",
+        json={
+            "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "reactions": True,
+            "focus": "How did people react to the tax and tariff segment?",
+            "limit": 50,
+        },
+    )
+    assert resp2.status == 200
+    data2 = await resp2.json()
+    assert data2["mode"] == "reactions"
+    assert data2["analysis"]["focused_answer"] is not None
+    assert data2["audience_reaction"] is not None
+    assert "overall_sentiment" in data2["audience_reaction"]
+    assert "reactions_by_video_part" in data2["audience_reaction"]
+    assert data2["comment_stats"]["total_stored"] == 2
+    assert data2["comment_stats"]["flagged_count"] == 1
+    assert len(data2["flagged_comments"]) == 1
+    assert "@viewer_one" in data2["flagged_comments"][0]["author"]
+
+
+
 
 

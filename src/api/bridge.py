@@ -2143,6 +2143,298 @@ async def handle_replies(request: web.Request) -> web.Response:
         )
 
 
+def _extract_youtube_video_id(raw_input: str) -> Optional[str]:
+    """Extract 11-character YouTube video ID from URL (watch, youtu.be, shorts, live, embed) or bare ID."""
+    text = raw_input.strip()
+    if not text:
+        return None
+    patterns = [
+        r"(?:v=|youtu\.be/|/shorts/|/live/|/embed/|/v/)([A-Za-z0-9_-]{11})(?:[?&/#]|$)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return m.group(1)
+    if re.match(r"^[A-Za-z0-9_-]{11}$", text):
+        return text
+    return None
+
+
+async def handle_video(request: web.Request) -> web.Response:
+    """GET/POST /api/video or /api/video/analyze — Analyze a YouTube video (Option 1: video content/transcript only; Option 2: video content + viewer comment reactions)."""
+    body: Dict[str, Any] = {}
+    if request.can_read_body:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+    raw_url = (
+        body.get("url")
+        or body.get("video")
+        or body.get("target")
+        or body.get("id")
+        or body.get("handle")
+        or request.query.get("url")
+        or request.query.get("video")
+        or request.query.get("target")
+        or request.query.get("id")
+        or request.query.get("handle")
+        or ""
+    ).strip()
+
+    if not raw_url:
+        return web.json_response(
+            {
+                "error": "Missing required 'url' or 'video' parameter.",
+                "hint": "Pass a YouTube video URL/ID (e.g. https://www.youtube.com/watch?v=...) or channel @handle.",
+            },
+            status=400,
+        )
+
+    # Determine mode: Option 1 ("video") vs Option 2 ("reactions")
+    raw_mode = str(body.get("mode") or request.query.get("mode") or "").strip().lower()
+    reactions_flag = (
+        body.get("reactions")
+        or body.get("with_reactions")
+        or body.get("include_comments")
+        or body.get("with_comments")
+        or request.query.get("reactions")
+        or request.query.get("with_reactions")
+        or request.query.get("include_comments")
+        or request.query.get("with_comments")
+    )
+    is_reactions = raw_mode in ("reactions", "reaction", "comments", "full", "2", "option2", "both") or (
+        str(reactions_flag).lower() in ("true", "1", "yes")
+    )
+    effective_mode = "reactions" if is_reactions else "video"
+
+    focus = (body.get("focus") or body.get("question") or request.query.get("focus") or request.query.get("question") or "").strip() or None
+    limit = min(max(10, int(body.get("limit") or request.query.get("limit") or 100)), 500)
+    post_index = max(1, int(body.get("post_index") or request.query.get("post_index") or 1))
+    lang_str = (body.get("lang") or request.query.get("lang") or "").strip()
+    preferred_langs = [l.strip() for l in lang_str.split(",") if l.strip()] if lang_str else None
+
+    yt_collector = YouTubeCollector()
+    try:
+        video_id = _extract_youtube_video_id(raw_url)
+        resolved_from_channel = None
+
+        # If input is a YouTube channel (@handle or channel URL) rather than a direct video URL, resolve Nth video
+        if not video_id:
+            yt_username = _extract_youtube_profile_username(raw_url, explicit_platform="youtube")
+            if yt_username:
+                _, posts = await _fetch_youtube_profile_and_posts(yt_collector, yt_username, count=max(5, post_index))
+                if not posts:
+                    return web.json_response(
+                        {"error": f"Could not resolve recent videos for YouTube channel '{yt_username}'."},
+                        status=404,
+                    )
+                if post_index > len(posts):
+                    return web.json_response(
+                        {
+                            "error": f"Requested post_index={post_index}, but channel '{yt_username}' only returned {len(posts)} videos.",
+                            "recent_posts": posts,
+                        },
+                        status=400,
+                    )
+                selected = posts[post_index - 1]
+                video_id = selected.get("video_id") or selected.get("shortcode")
+                resolved_from_channel = yt_username
+
+        if not video_id:
+            return web.json_response(
+                {
+                    "error": f"Could not extract a valid YouTube video ID from '{raw_url}'.",
+                    "hint": "Provide a YouTube watch URL, shorts URL, youtu.be link, 11-char video ID, or YouTube @channel.",
+                },
+                status=400,
+            )
+
+        # Fetch video details, chapters, and transcript
+        video_bundle = await yt_collector.fetch_video_details_and_transcript(
+            video_id=video_id,
+            preferred_langs=preferred_langs,
+        )
+        video_meta = video_bundle["video"]
+        transcript_info = video_bundle["transcript"]
+
+        comment_stats: Optional[Dict[str, Any]] = None
+        flagged_comments: List[Dict[str, Any]] = []
+        sample_comments: List[Dict[str, Any]] = []
+        llm_comments_input: List[Dict[str, Any]] = []
+
+        # Option 2 ("reactions"): Scrape & evaluate video comments via 40-comment micro-batch processor
+        if effective_mode == "reactions":
+            clean_video_url = f"https://www.youtube.com/watch?v={video_id}"
+            target_title = f"YouTube {video_meta.get('channel_name') or ''}: {(video_meta.get('title') or video_id)[:80]}".strip()
+
+            async with async_session_factory() as session:
+                t_repo = TargetRepository(session)
+                target = await t_repo.create_or_activate(
+                    platform="youtube",
+                    target_type="post_url",
+                    external_id=video_id,
+                    url=clean_video_url,
+                    title_or_name=target_title,
+                    is_active=False,
+                )
+                await session.commit()
+                target_id = target.id
+
+            mtproto = request.app.get("mtproto")
+            newly_inserted, evaluated_in_run, _ = await _execute_inline_scrape(
+                target_id=target_id,
+                mtproto=mtproto,
+                limit=limit,
+            )
+
+            threshold = settings.LLM_ALERT_SEVERITY_THRESHOLD
+            async with async_session_factory() as session:
+                rows_stmt = (
+                    select(Comment, PlatformAuthor)
+                    .outerjoin(PlatformAuthor, Comment.author_id == PlatformAuthor.id)
+                    .where(Comment.target_id == target_id)
+                    .order_by(
+                        desc(func.coalesce(Comment.severity_score, -1)),
+                        desc(Comment.published_at),
+                    )
+                )
+                rows = (await session.execute(rows_stmt)).all()
+
+                total_stored = len(rows)
+                evaluated_cnt = 0
+                noise_skipped = 0
+                score_sum = 0
+                dist = {
+                    "0_1_benign": 0,
+                    "2_3_venting": 0,
+                    "4_6_cynical_or_claims": 0,
+                    "7_8_hostile": 0,
+                    "9_10_critical": 0,
+                }
+
+                for c_obj, a_obj in rows:
+                    formatted = _format_comment(c_obj, a_obj, max_text=220, threshold=threshold)
+                    if c_obj.llm_status == "skipped_prefilter":
+                        noise_skipped += 1
+                    elif c_obj.severity_score is not None:
+                        evaluated_cnt += 1
+                        sc = int(c_obj.severity_score or 0)
+                        score_sum += sc
+                        if sc <= 1:
+                            dist["0_1_benign"] += 1
+                        elif sc <= 3:
+                            dist["2_3_venting"] += 1
+                        elif sc <= 6:
+                            dist["4_6_cynical_or_claims"] += 1
+                        elif sc <= 8:
+                            dist["7_8_hostile"] += 1
+                        else:
+                            dist["9_10_critical"] += 1
+
+                    if formatted.get("flagged"):
+                        flagged_comments.append(formatted)
+                    elif len(sample_comments) < 12:
+                        sample_comments.append(formatted)
+
+                    if len(llm_comments_input) < 60 and c_obj.content_text:
+                        author_label = (a_obj.username or a_obj.display_name) if a_obj else "user"
+                        llm_comments_input.append(
+                            {
+                                "author": author_label,
+                                "text": c_obj.content_text[:240],
+                                "severity_score": int(c_obj.severity_score) if c_obj.severity_score is not None else None,
+                                "reason": c_obj.llm_reason,
+                            }
+                        )
+
+                comment_stats = {
+                    "total_stored": total_stored,
+                    "newly_ingested": newly_inserted,
+                    "evaluated": evaluated_cnt,
+                    "noise_skipped": noise_skipped,
+                    "flagged_count": len(flagged_comments),
+                    "avg_severity": round(score_sum / evaluated_cnt, 2) if evaluated_cnt > 0 else 0.0,
+                    "score_distribution": dist,
+                }
+
+        # Run DeepSeek Video Intelligence Analysis (Option 1 or Option 2)
+        from src.llm.client import DeepSeekClassifier
+
+        classifier = DeepSeekClassifier()
+        llm_payload: Dict[str, Any] = {
+            "mode": effective_mode,
+            "focus": focus,
+            "video": {
+                "video_id": video_meta["video_id"],
+                "title": video_meta["title"],
+                "channel_name": video_meta["channel_name"],
+                "published_at": video_meta["published_at"],
+                "duration_formatted": video_meta["duration_formatted"],
+                "view_count": video_meta["view_count"],
+                "like_count": video_meta["like_count"],
+                "comment_count": video_meta["comment_count"],
+                "description": (video_meta.get("description") or "")[:3000],
+                "tags": (video_meta.get("tags") or [])[:25],
+                "chapters": video_meta.get("chapters") or [],
+            },
+            "transcript_available": transcript_info["available"],
+            "transcript_language": transcript_info["language_name"] or transcript_info["language"],
+            "transcript_text": (transcript_info.get("full_text") or "")[:24000],
+            "transcript_segments": (transcript_info.get("segments") or [])[:80],
+        }
+        if effective_mode == "reactions":
+            llm_payload["comment_stats"] = comment_stats
+            llm_payload["comments"] = llm_comments_input
+
+        analysis_result = await classifier.analyze_video(llm_payload)
+        audience_reaction = analysis_result.pop("audience_reaction", None)
+
+        response_data: Dict[str, Any] = {
+            "status": "completed",
+            "mode": effective_mode,
+            "focus": focus,
+            "video": video_meta,
+            "transcript": {
+                "available": transcript_info["available"],
+                "language": transcript_info["language"],
+                "language_name": transcript_info["language_name"],
+                "is_auto_generated": transcript_info["is_auto_generated"],
+                "available_languages": transcript_info["available_languages"],
+                "segment_count": transcript_info["segment_count"],
+                "full_text": transcript_info["full_text"],
+                "segments": transcript_info["segments"][:150],
+            },
+            "analysis": analysis_result,
+        }
+        if resolved_from_channel:
+            response_data["resolved_from_channel"] = resolved_from_channel
+            response_data["post_index"] = post_index
+
+        if effective_mode == "reactions":
+            response_data["audience_reaction"] = audience_reaction
+            response_data["comment_stats"] = comment_stats
+            response_data["flagged_comments"] = flagged_comments[:15]
+            response_data["sample_comments"] = sample_comments[:10]
+
+        return web.json_response(response_data)
+
+    except ScraperError as s_err:
+        return web.json_response(
+            {"error": s_err.error_code, "message": s_err.message, "platform": "youtube"},
+            status=s_err.status_code,
+        )
+    except Exception as exc:
+        logger.exception("Unhandled error in handle_video", error=str(exc), exc_info=True)
+        return web.json_response(
+            {"error": "server_error", "message": f"Video analysis failed: {exc}", "platform": "youtube"},
+            status=500,
+        )
+    finally:
+        await yt_collector.stop()
+
+
 def create_bridge_app(mtproto: Optional[Any] = None) -> web.Application:
     """Create the aiohttp web.Application for the internal Hermes bridge."""
     app = web.Application(middlewares=[auth_middleware])
@@ -2165,6 +2457,10 @@ def create_bridge_app(mtproto: Optional[Any] = None) -> web.Application:
     app.router.add_post("/api/replies", handle_replies)
     app.router.add_get("/api/scrape/replies", handle_replies)
     app.router.add_post("/api/scrape/replies", handle_replies)
+    app.router.add_get("/api/video", handle_video)
+    app.router.add_post("/api/video", handle_video)
+    app.router.add_get("/api/video/analyze", handle_video)
+    app.router.add_post("/api/video/analyze", handle_video)
     app.router.add_post("/api/scrape", handle_scrape)
     app.router.add_get("/api/scrape", handle_scrape)
     app.router.add_delete("/api/target", handle_delete_target)

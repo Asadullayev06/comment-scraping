@@ -2,6 +2,8 @@
 
 import re
 import json
+import html
+import xml.etree.ElementTree as ET
 from typing import AsyncIterator, Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone
 import httpx
@@ -20,6 +22,142 @@ YT_WEB_HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+YT_ANDROID_UA = "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip"
+
+
+def format_seconds_to_timestamp(seconds: float) -> str:
+    """Format seconds into MM:SS or HH:MM:SS string."""
+    total_sec = max(0, int(seconds))
+    hrs, rem = divmod(total_sec, 3600)
+    mins, secs = divmod(rem, 60)
+    if hrs > 0:
+        return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+def parse_iso8601_duration(iso_str: Optional[str]) -> int:
+    """Parse ISO-8601 duration string (e.g. 'PT1H12M34S') into total seconds."""
+    if not iso_str:
+        return 0
+    m = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", str(iso_str).strip(), flags=re.IGNORECASE)
+    if not m:
+        return 0
+    hrs = int(m.group(1) or 0)
+    mins = int(m.group(2) or 0)
+    secs = int(m.group(3) or 0)
+    return hrs * 3600 + mins * 60 + secs
+
+
+def extract_chapters_from_description(description: Optional[str]) -> List[Dict[str, Any]]:
+    """Extract timestamped chapter markers from a YouTube video description."""
+    if not description:
+        return []
+    chapters: List[Dict[str, Any]] = []
+    for line in description.splitlines():
+        line_clean = line.strip()
+        m = re.match(r"^(?:[\-\*\•]\s*)?(\d{1,2}:\d{2}(?::\d{2})?)\s*[\-–—:]?\s*(.+)$", line_clean)
+        if m:
+            ts_str = m.group(1)
+            title = m.group(2).strip()
+            parts = [int(p) for p in ts_str.split(":")]
+            if len(parts) == 3:
+                sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
+            else:
+                sec = parts[0] * 60 + parts[1]
+            if title:
+                chapters.append(
+                    {
+                        "timestamp": format_seconds_to_timestamp(sec),
+                        "start_seconds": sec,
+                        "title": title[:120],
+                    }
+                )
+    return chapters
+
+
+def parse_youtube_timedtext(raw_content: str) -> List[Dict[str, Any]]:
+    """Parse YouTube timedtext response (XML format 3, XML format 1, or JSON3) into timestamped segments."""
+    if not raw_content or not raw_content.strip():
+        return []
+
+    text_stripped = raw_content.strip()
+    segments: List[Dict[str, Any]] = []
+
+    # 1. Try JSON3 format if response starts with '{'
+    if text_stripped.startswith("{"):
+        try:
+            jdata = json.loads(text_stripped)
+            for ev in jdata.get("events") or []:
+                segs = ev.get("segs") or []
+                raw_txt = "".join(s.get("utf8", "") for s in segs if isinstance(s, dict))
+                clean_txt = " ".join(html.unescape(raw_txt).split()).strip()
+                if not clean_txt:
+                    continue
+                t_ms = int(ev.get("tStartMs") or 0)
+                d_ms = int(ev.get("dDurationMs") or 0)
+                start_sec = round(t_ms / 1000.0, 1)
+                dur_sec = round(d_ms / 1000.0, 1)
+                if segments and segments[-1]["text"] == clean_txt:
+                    continue
+                segments.append(
+                    {
+                        "timestamp": format_seconds_to_timestamp(start_sec),
+                        "start": start_sec,
+                        "duration": dur_sec,
+                        "text": clean_txt,
+                    }
+                )
+            return segments
+        except Exception:
+            pass
+
+    # 2. Try XML format (<timedtext format="3"><p t="..." d="..."> or <transcript><text start="..." dur="...">)
+    try:
+        root = ET.fromstring(text_stripped)
+        p_nodes = root.findall(".//p")
+        if p_nodes:
+            for p in p_nodes:
+                raw_txt = "".join(p.itertext())
+                clean_txt = " ".join(html.unescape(raw_txt).split()).strip()
+                if not clean_txt:
+                    continue
+                t_ms = int(p.attrib.get("t") or 0)
+                d_ms = int(p.attrib.get("d") or 0)
+                start_sec = round(t_ms / 1000.0, 1)
+                dur_sec = round(d_ms / 1000.0, 1)
+                if segments and segments[-1]["text"] == clean_txt:
+                    continue
+                segments.append(
+                    {
+                        "timestamp": format_seconds_to_timestamp(start_sec),
+                        "start": start_sec,
+                        "duration": dur_sec,
+                        "text": clean_txt,
+                    }
+                )
+        else:
+            for t_el in root.findall(".//text"):
+                raw_txt = "".join(t_el.itertext())
+                clean_txt = " ".join(html.unescape(raw_txt).split()).strip()
+                if not clean_txt:
+                    continue
+                start_sec = round(float(t_el.attrib.get("start") or 0.0), 1)
+                dur_sec = round(float(t_el.attrib.get("dur") or 0.0), 1)
+                if segments and segments[-1]["text"] == clean_txt:
+                    continue
+                segments.append(
+                    {
+                        "timestamp": format_seconds_to_timestamp(start_sec),
+                        "start": start_sec,
+                        "duration": dur_sec,
+                        "text": clean_txt,
+                    }
+                )
+    except Exception as e:
+        logger.warning("Failed to parse YouTube timedtext XML", error=str(e))
+
+    return segments
 
 
 def build_youtube_comment_url(video_id: str, comment_id: str) -> str:
@@ -513,3 +651,264 @@ class YouTubeCollector(BaseCollector):
         """Return only the recent videos list for a YouTube channel."""
         _, posts = await self.fetch_profile_info_and_posts(username, count=count)
         return posts
+
+    async def fetch_video_details_and_transcript(
+        self,
+        video_id: str,
+        preferred_langs: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Fetch comprehensive YouTube video metadata, chapters, and timestamped transcript via InnerTube ANDROID player & Data API v3."""
+        vid = str(video_id).strip()
+        if not vid:
+            raise ScraperError("invalid video id", "Missing YouTube video ID", status_code=400)
+
+        langs = [l.strip().lower() for l in (preferred_langs or ["uz", "ru", "en", "tr", "az", "kk"]) if l.strip()]
+
+        video_meta: Dict[str, Any] = {
+            "video_id": vid,
+            "url": f"https://www.youtube.com/watch?v={vid}",
+            "title": None,
+            "channel_name": None,
+            "channel_id": None,
+            "published_at": None,
+            "duration_seconds": 0,
+            "duration_formatted": "00:00",
+            "view_count": 0,
+            "like_count": 0,
+            "comment_count": 0,
+            "description": "",
+            "tags": [],
+            "category": None,
+            "chapters": [],
+        }
+
+        caption_tracks: List[Dict[str, Any]] = []
+        found_video = False
+
+        # 1. InnerTube ANDROID player request (provides un-throttled captionTracks + full videoDetails)
+        try:
+            player_resp = await self.http_client.post(
+                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                json={
+                    "context": {
+                        "client": {
+                            "clientName": "ANDROID",
+                            "clientVersion": "20.10.38",
+                            "androidSdkVersion": 34,
+                            "hl": "en",
+                            "gl": "US",
+                        }
+                    },
+                    "videoId": vid,
+                },
+                headers={"User-Agent": YT_ANDROID_UA},
+            )
+            if player_resp.status_code == 200:
+                pdata = player_resp.json() or {}
+                play_status = (pdata.get("playabilityStatus") or {}).get("status")
+                v_details = pdata.get("videoDetails") or {}
+                if v_details and v_details.get("videoId") == vid and play_status != "ERROR":
+                    found_video = True
+                    video_meta["title"] = v_details.get("title") or video_meta["title"]
+                    video_meta["channel_name"] = v_details.get("author") or video_meta["channel_name"]
+                    video_meta["channel_id"] = v_details.get("channelId") or video_meta["channel_id"]
+                    dur_sec = int(v_details.get("lengthSeconds") or 0)
+                    video_meta["duration_seconds"] = dur_sec
+                    video_meta["duration_formatted"] = format_seconds_to_timestamp(dur_sec)
+                    video_meta["view_count"] = int(v_details.get("viewCount") or 0)
+                    video_meta["description"] = v_details.get("shortDescription") or ""
+                    video_meta["tags"] = v_details.get("keywords") or []
+
+                micro = (pdata.get("microformat") or {}).get("playerMicroformatRenderer") or {}
+                if micro:
+                    video_meta["published_at"] = micro.get("publishDate") or micro.get("uploadDate") or video_meta["published_at"]
+                    video_meta["category"] = micro.get("category") or video_meta["category"]
+                    if not video_meta["description"]:
+                        desc_obj = micro.get("description") or {}
+                        video_meta["description"] = desc_obj.get("simpleText") or ""
+
+                caption_tracks = (
+                    (pdata.get("captions") or {})
+                    .get("playerCaptionsTracklistRenderer", {})
+                    .get("captionTracks")
+                    or []
+                )
+        except Exception as e:
+            logger.warning("InnerTube ANDROID player fetch failed", video_id=vid, error=str(e))
+
+        # 2. Enrich with official YouTube Data API v3 if API key is configured (adds exact likes, comment count, ISO publish date)
+        if self.api_key:
+            try:
+                v_resp = await self.http_client.get(
+                    "https://www.googleapis.com/youtube/v3/videos",
+                    params={
+                        "key": self.api_key,
+                        "part": "snippet,contentDetails,statistics",
+                        "id": vid,
+                    },
+                )
+                if v_resp.status_code == 200:
+                    items = (v_resp.json() or {}).get("items") or []
+                    if items:
+                        found_video = True
+                        item = items[0]
+                        snip = item.get("snippet") or {}
+                        stats = item.get("statistics") or {}
+                        cdet = item.get("contentDetails") or {}
+
+                        video_meta["title"] = snip.get("title") or video_meta["title"]
+                        video_meta["channel_name"] = snip.get("channelTitle") or video_meta["channel_name"]
+                        video_meta["channel_id"] = snip.get("channelId") or video_meta["channel_id"]
+                        video_meta["published_at"] = snip.get("publishedAt") or video_meta["published_at"]
+                        if snip.get("description"):
+                            video_meta["description"] = snip["description"]
+                        if snip.get("tags"):
+                            video_meta["tags"] = snip["tags"]
+
+                        dur_iso = parse_iso8601_duration(cdet.get("duration"))
+                        if dur_iso > 0:
+                            video_meta["duration_seconds"] = dur_iso
+                            video_meta["duration_formatted"] = format_seconds_to_timestamp(dur_iso)
+
+                        video_meta["view_count"] = int(stats.get("viewCount") or video_meta["view_count"] or 0)
+                        video_meta["like_count"] = int(stats.get("likeCount") or video_meta["like_count"] or 0)
+                        video_meta["comment_count"] = int(stats.get("commentCount") or video_meta["comment_count"] or 0)
+            except Exception as e:
+                logger.warning("YouTube Data API v3 video metadata lookup failed", video_id=vid, error=str(e))
+
+        # 3. Fallback to watch page HTML if neither succeeded or if caption_tracks is still empty
+        if not found_video or not caption_tracks:
+            try:
+                watch_resp = await self.http_client.get(f"https://www.youtube.com/watch?v={vid}")
+                if watch_resp.status_code == 200:
+                    html_text = watch_resp.text
+                    m_pr = re.search(r"var ytInitialPlayerResponse\s*=\s*(\{.*?\});", html_text)
+                    if m_pr:
+                        pr_data = json.loads(m_pr.group(1))
+                        play_st = (pr_data.get("playabilityStatus") or {}).get("status")
+                        vd = pr_data.get("videoDetails") or {}
+                        if vd and vd.get("videoId") == vid and play_st != "ERROR":
+                            found_video = True
+                            video_meta["title"] = video_meta["title"] or vd.get("title")
+                            video_meta["channel_name"] = video_meta["channel_name"] or vd.get("author")
+                            video_meta["channel_id"] = video_meta["channel_id"] or vd.get("channelId")
+                            if not video_meta["duration_seconds"]:
+                                d_sec = int(vd.get("lengthSeconds") or 0)
+                                video_meta["duration_seconds"] = d_sec
+                                video_meta["duration_formatted"] = format_seconds_to_timestamp(d_sec)
+                            if not video_meta["view_count"]:
+                                video_meta["view_count"] = int(vd.get("viewCount") or 0)
+                            if not video_meta["description"]:
+                                video_meta["description"] = vd.get("shortDescription") or ""
+                            if not video_meta["tags"]:
+                                video_meta["tags"] = vd.get("keywords") or []
+                        if not caption_tracks:
+                            caption_tracks = (
+                                (pr_data.get("captions") or {})
+                                .get("playerCaptionsTracklistRenderer", {})
+                                .get("captionTracks")
+                                or []
+                            )
+            except Exception as e:
+                logger.warning("YouTube watch HTML fallback failed", video_id=vid, error=str(e))
+
+        if not found_video:
+            raise ScraperError("video not found", f"YouTube video '{vid}' not found or unavailable", status_code=404)
+
+        video_meta["chapters"] = extract_chapters_from_description(video_meta.get("description"))
+
+        # 4. Select best caption track and fetch transcript
+        available_languages: List[Dict[str, Any]] = []
+        for tr in caption_tracks:
+            l_code = str(tr.get("languageCode") or "")
+            name_obj = tr.get("name") or {}
+            l_name = name_obj.get("simpleText") or "".join(r.get("text", "") for r in (name_obj.get("runs") or [])) or l_code
+            is_auto = tr.get("kind") == "asr"
+            available_languages.append(
+                {
+                    "code": l_code,
+                    "name": l_name,
+                    "is_auto": is_auto,
+                }
+            )
+
+        selected_track: Optional[Dict[str, Any]] = None
+        if caption_tracks:
+            # Score each track by preferred language order + manual over ASR
+            def _track_rank(t: Dict[str, Any]) -> Tuple[int, int]:
+                code = str(t.get("languageCode") or "").lower()
+                base_code = code.split("-")[0]
+                lang_idx = 999
+                for idx, pref in enumerate(langs):
+                    if code == pref or base_code == pref:
+                        lang_idx = idx
+                        break
+                is_asr = 1 if t.get("kind") == "asr" else 0
+                return (lang_idx, is_asr)
+
+            sorted_tracks = sorted(caption_tracks, key=_track_rank)
+            selected_track = sorted_tracks[0]
+
+        segments: List[Dict[str, Any]] = []
+        selected_lang = None
+        selected_lang_name = None
+        selected_is_auto = False
+
+        if selected_track and selected_track.get("baseUrl"):
+            base_url = selected_track["baseUrl"]
+            selected_lang = selected_track.get("languageCode")
+            name_obj = selected_track.get("name") or {}
+            selected_lang_name = (
+                name_obj.get("simpleText")
+                or "".join(r.get("text", "") for r in (name_obj.get("runs") or []))
+                or selected_lang
+            )
+            selected_is_auto = selected_track.get("kind") == "asr"
+
+            try:
+                t_resp = await self.http_client.get(base_url, headers={"User-Agent": YT_ANDROID_UA})
+                if t_resp.status_code == 200 and t_resp.text.strip():
+                    segments = parse_youtube_timedtext(t_resp.text)
+                if not segments:
+                    t_resp_j = await self.http_client.get(f"{base_url}&fmt=json3", headers={"User-Agent": YT_ANDROID_UA})
+                    if t_resp_j.status_code == 200 and t_resp_j.text.strip():
+                        segments = parse_youtube_timedtext(t_resp_j.text)
+            except Exception as e:
+                logger.warning("Failed to download YouTube caption track", video_id=vid, error=str(e))
+
+        # Group segments into ~20-second blocks for a clean, readable timestamped transcript
+        grouped_lines: List[str] = []
+        bucket_start: Optional[float] = None
+        bucket_texts: List[str] = []
+        for seg in segments:
+            s_time = float(seg.get("start") or 0.0)
+            s_txt = seg.get("text") or ""
+            if not s_txt:
+                continue
+            if bucket_start is None:
+                bucket_start = s_time
+                bucket_texts = [s_txt]
+            elif s_time - bucket_start >= 20.0:
+                grouped_lines.append(f"[{format_seconds_to_timestamp(bucket_start)}] {' '.join(bucket_texts)}")
+                bucket_start = s_time
+                bucket_texts = [s_txt]
+            else:
+                bucket_texts.append(s_txt)
+        if bucket_start is not None and bucket_texts:
+            grouped_lines.append(f"[{format_seconds_to_timestamp(bucket_start)}] {' '.join(bucket_texts)}")
+
+        full_transcript_text = "\n".join(grouped_lines)
+
+        return {
+            "video": video_meta,
+            "transcript": {
+                "available": len(segments) > 0,
+                "language": selected_lang,
+                "language_name": selected_lang_name,
+                "is_auto_generated": selected_is_auto,
+                "available_languages": available_languages,
+                "segment_count": len(segments),
+                "full_text": full_transcript_text,
+                "segments": segments,
+            },
+        }

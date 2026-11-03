@@ -183,6 +183,59 @@ def build_parser() -> argparse.ArgumentParser:
     p_replies.add_argument("handle", type=str, help="X @handle or profile URL (e.g. @username or https://x.com/username)")
     p_replies.add_argument("--limit", "--count", dest="limit", type=int, default=20, help="Number of recent replies to fetch and evaluate (default: 20)")
 
+    # 3d-2. ops video (also aliased as ops analyze)
+    for v_cmd in ("video", "analyze"):
+        p_video = sub.add_parser(
+            v_cmd,
+            help=(
+                "Analyze a YouTube video. Supports two options:\n"
+                "  Option 1 (default): Analyze video content, transcript, key moments, claims & tone (--mode video).\n"
+                "  Option 2 (--reactions): Analyze video content AND viewer reactions to specific parts of the video."
+            ),
+        )
+        p_video.add_argument("url", type=str, help="YouTube video URL, 11-char video ID, or YouTube channel @handle")
+        p_video.add_argument(
+            "--mode",
+            type=str,
+            choices=["video", "reactions"],
+            default="video",
+            help="Analysis mode: 'video' (Option 1: video content only) or 'reactions' (Option 2: video + comment reactions)",
+        )
+        p_video.add_argument(
+            "--reactions",
+            "--with-reactions",
+            "--with-comments",
+            dest="reactions",
+            action="store_true",
+            help="Enable Option 2: scrape & evaluate comments and correlate viewer reactions with specific parts of the video",
+        )
+        p_video.add_argument(
+            "--focus",
+            "--question",
+            dest="focus",
+            type=str,
+            default="",
+            help="Optional question, timestamp, or specific part/topic in the video to focus on",
+        )
+        p_video.add_argument(
+            "--limit",
+            type=int,
+            default=100,
+            help="Max comments to scrape and evaluate when in --reactions (Option 2) mode (default: 100)",
+        )
+        p_video.add_argument(
+            "--post-index",
+            type=int,
+            default=1,
+            help="If a YouTube @channel is passed instead of a video URL: 1 = latest video, 2 = 2nd latest, etc.",
+        )
+        p_video.add_argument(
+            "--lang",
+            type=str,
+            default="",
+            help="Optional preferred transcript language codes (e.g. 'uz,ru,en')",
+        )
+
     # 3e. ops untarget
     p_untarget = sub.add_parser(
         "untarget",
@@ -286,6 +339,22 @@ def main():
             method="POST",
             body={"handle": args.handle, "limit": args.limit},
             timeout=180,
+        )
+    elif args.command in ("video", "analyze"):
+        effective_mode = "reactions" if (args.reactions or args.mode == "reactions") else "video"
+        res = api_request(
+            "/api/video",
+            method="POST",
+            body={
+                "url": args.url,
+                "mode": effective_mode,
+                "reactions": effective_mode == "reactions",
+                "focus": args.focus or None,
+                "limit": args.limit,
+                "post_index": args.post_index,
+                "lang": args.lang or None,
+            },
+            timeout=240,
         )
     elif args.command == "untarget":
         res = api_request(

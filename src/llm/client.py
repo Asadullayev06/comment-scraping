@@ -7,7 +7,7 @@ from openai import AsyncOpenAI
 import structlog
 from src.config import settings
 from src.schemas.llm import CommentBatchItem, CommentVerdict, BatchEvaluationResponse
-from src.llm.prompts import CLASSIFICATION_SYSTEM_PROMPT
+from src.llm.prompts import CLASSIFICATION_SYSTEM_PROMPT, VIDEO_ANALYSIS_SYSTEM_PROMPT
 
 logger = structlog.get_logger(__name__)
 
@@ -138,3 +138,116 @@ class DeepSeekClassifier:
                     )
                 )
         return verdicts
+
+    async def analyze_video(
+        self,
+        video_payload: Dict[str, Any],
+        max_retries: int = 3,
+    ) -> Dict[str, Any]:
+        """Analyze a YouTube video's content/transcript (Option 1: mode='video') or video + audience reactions (Option 2: mode='reactions')."""
+        if not self.api_key or self.api_key.startswith("sk-xxxx") or self.api_key == "mock-key":
+            logger.warning("DeepSeek API key not configured; running heuristic mock video analysis")
+            return self._heuristic_mock_analyze_video(video_payload)
+
+        user_content = json.dumps(video_payload, ensure_ascii=False)
+        messages = [
+            {"role": "system", "content": VIDEO_ANALYSIS_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Analyze the following YouTube video data and return the JSON intelligence report:\n{user_content}"},
+        ]
+
+        attempt = 0
+        backoff = 1.5
+        while attempt < max_retries:
+            attempt += 1
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                )
+                content = response.choices[0].message.content or "{}"
+                parsed_json = json.loads(content)
+                if not isinstance(parsed_json, dict):
+                    parsed_json = {}
+                return parsed_json
+            except Exception as exc:
+                logger.error("DeepSeek video analysis attempt failed", attempt=attempt, error=str(exc))
+                if attempt >= max_retries:
+                    return self._heuristic_mock_analyze_video(video_payload)
+                await asyncio.sleep(backoff)
+                backoff *= 2.0
+
+        return self._heuristic_mock_analyze_video(video_payload)
+
+    def _heuristic_mock_analyze_video(self, video_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Offline fallback video analyzer for unit tests or unconfigured API key."""
+        mode = video_payload.get("mode") or "video"
+        focus = video_payload.get("focus")
+        v_meta = video_payload.get("video") or {}
+        title = v_meta.get("title") or "YouTube Video"
+        channel = v_meta.get("channel_name") or "Unknown Channel"
+        transcript_text = (video_payload.get("transcript_text") or "").strip()
+        desc = (v_meta.get("description") or "").strip()
+
+        combined = f"{title} {desc} {transcript_text}".lower()
+        trigger_keywords = ["qanun", "vergi", "rejim", "soyğun", "etiraz", "soliq", "jarima", "hokimiyat", "коррупция", "чиновники", "corruption", "tax", "tariff"]
+        on_topic = any(kw in combined for kw in trigger_keywords)
+        sev_score = 5 if on_topic else 1
+
+        key_moments = []
+        segments = video_payload.get("transcript_segments") or []
+        for seg in segments[:3]:
+            key_moments.append(
+                {
+                    "timestamp": seg.get("timestamp", "00:00"),
+                    "topic": "Transcript segment",
+                    "summary": seg.get("text", ""),
+                }
+            )
+
+        audience_reaction = None
+        if mode == "reactions":
+            comments = video_payload.get("comments") or []
+            hostile_samples = [
+                f"@{c.get('author', 'user')}: {c.get('text', '')[:100]}"
+                for c in comments
+                if (c.get("severity_score") or 0) >= 7
+            ][:3]
+            all_samples = [
+                f"@{c.get('author', 'user')}: {c.get('text', '')[:100]}"
+                for c in comments[:3]
+            ]
+            audience_reaction = {
+                "overall_sentiment": (
+                    f"Analyzed {len(comments)} viewer comments; {len(hostile_samples)} flagged for high hostility."
+                    if comments
+                    else "No viewer comments available for this video."
+                ),
+                "agreement_with_video": "Viewers actively engage with the video's core topic and express strong opinions on the issues raised.",
+                "narrative_divergence": "Commenters focus on practical policy impacts and accountability.",
+                "dominant_viewer_grievances": ["Public policy implementation", "Official accountability"] if hostile_samples else ["General discussion"],
+                "reactions_by_video_part": [
+                    {
+                        "video_part": f"{key_moments[0]['timestamp']} - {key_moments[0]['summary'][:60]}" if key_moments else f"00:00 - {title[:60]}",
+                        "viewer_reaction": "Viewers reacted directly to this segment in the comment section.",
+                        "sentiment": "hostile" if hostile_samples else "mixed",
+                        "sample_comments": hostile_samples or all_samples,
+                    }
+                ] if (key_moments or comments) else [],
+            }
+
+        return {
+            "summary": f"Video '{title}' by {channel}. " + (transcript_text[:200] if transcript_text else (desc[:200] or "No transcript text available.")),
+            "language": video_payload.get("transcript_language") or "unknown",
+            "on_topic": on_topic,
+            "severity_score": sev_score,
+            "severely_negative": sev_score >= 7,
+            "tone_and_stance": "Critical commentary" if on_topic else "Informational / general content",
+            "main_topics": (v_meta.get("tags") or [])[:5] or [title[:50]],
+            "key_moments": key_moments,
+            "claims_and_allegations": [],
+            "risk_assessment": "Moderate policy discussion." if on_topic else "Low risk informational video.",
+            "focused_answer": f"Focused analysis on '{focus}': addressed in video '{title}'." if focus else None,
+            "audience_reaction": audience_reaction,
+        }
