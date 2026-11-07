@@ -1250,7 +1250,7 @@ async def test_bridge_youtube_video_analysis_option1_and_option2(bridge_client, 
     data1 = await resp1.json()
     assert data1["mode"] == "video"
     assert data1["provider"] == "gemini"
-    assert data1["model"] == "gemini-2.5-flash"
+    assert data1["model"] == bridge_mod.settings.GEMINI_MODEL
     assert data1["video"]["video_id"] == "dQw4w9WgXcQ"
     assert data1["video"]["url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     assert "transcript" not in data1
@@ -1340,6 +1340,7 @@ async def test_bridge_video_gemini_direct_youtube_url_call(bridge_client, monkey
         )
 
     monkeypatch.setattr(settings, "GEMINI_API_KEY", "AIzaSyTestGeminiKey123")
+    monkeypatch.setattr(settings, "GEMINI_MODEL", "gemini-3.8-flash")
     monkeypatch.setattr(YouTubeCollector, "fetch_video_metadata", mock_fetch_video_metadata)
     monkeypatch.setattr(httpx.AsyncClient, "post", mock_httpx_post)
 
@@ -1350,13 +1351,13 @@ async def test_bridge_video_gemini_direct_youtube_url_call(bridge_client, monkey
     assert resp.status == 200
     data = await resp.json()
     assert data["provider"] == "gemini"
-    assert data["model"] == "gemini-2.5-flash"
+    assert data["model"] == "gemini-3.8-flash"
     assert data["focus"] == "What is said about tariffs?"
     assert data["analysis"]["language"] == "uz"
     assert data["analysis"]["focused_answer"] == "The speaker argues at [12:30] that tariff increases need stronger oversight."
     assert len(captured_gemini_requests) == 1
     sent_req = captured_gemini_requests[0]
-    assert "gemini-2.5-flash:generateContent" in sent_req["url"]
+    assert "gemini-3.8-flash:generateContent" in sent_req["url"]
     assert sent_req["params"]["key"] == "AIzaSyTestGeminiKey123"
     parts = sent_req["json"]["contents"][0]["parts"]
     assert parts[0]["file_data"]["file_uri"] == "https://www.youtube.com/watch?v=aircAruvnKk"

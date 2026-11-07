@@ -2447,7 +2447,7 @@ async def handle_video(request: web.Request) -> web.Response:
                     "score_distribution": dist,
                 }
 
-        # Pass YouTube URL directly to Google Gemini API (gemini-2.5-flash)
+        # Pass YouTube URL directly to Google Gemini API
         from src.llm.client import DeepSeekClassifier
 
         classifier = DeepSeekClassifier()

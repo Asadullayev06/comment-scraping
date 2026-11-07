@@ -38,7 +38,7 @@ class Settings(BaseSettings):
 
     # Google Gemini API (For native YouTube video analysis via ops video)
     GEMINI_API_KEY: Optional[str] = Field(default=None)
-    GEMINI_MODEL: str = Field(default="gemini-2.5-flash")
+    GEMINI_MODEL: str = Field(default="gemini-3.8-flash")
 
     # X (Twitter) Official API v2 Bearer Token (Optional alternative to burner cookies)
     X_BEARER_TOKEN: Optional[str] = Field(default=None)

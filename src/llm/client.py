@@ -39,7 +39,7 @@ class DeepSeekClassifier:
         self.base_url = base_url or settings.DEEPSEEK_BASE_URL
         self.model = model or settings.DEEPSEEK_MODEL
         self.gemini_api_key = gemini_api_key if gemini_api_key is not None else settings.GEMINI_API_KEY
-        self.gemini_model = gemini_model or settings.GEMINI_MODEL or "gemini-2.5-flash"
+        self.gemini_model = gemini_model if gemini_model is not None else settings.GEMINI_MODEL
 
         self.client = AsyncOpenAI(
             api_key=self.api_key or "mock-key",
@@ -160,7 +160,7 @@ class DeepSeekClassifier:
         video_payload: Dict[str, Any],
         max_retries: int = 3,
     ) -> Dict[str, Any]:
-        """Analyze a YouTube video directly via the Google Gemini API (gemini-2.5-flash) by passing the YouTube URL in file_data."""
+        """Analyze a YouTube video directly via the Google Gemini API by passing the YouTube URL in file_data."""
         gemini_key = (self.gemini_api_key or settings.GEMINI_API_KEY or "").strip()
 
         # Offline mock mode for unit tests

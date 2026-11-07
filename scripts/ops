@@ -188,7 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
         p_video = sub.add_parser(
             v_cmd,
             help=(
-                "Analyze a YouTube video via Google Gemini (gemini-2.5-flash). Supports two options:\n"
+                "Analyze a YouTube video via Google Gemini. Supports two options:\n"
                 "  Option 1 (default): Pass YouTube URL directly to Gemini for compact video summary, key moments, claims & query answers (--mode video).\n"
                 "  Option 2 (--reactions): Analyze video content via Gemini AND correlate viewer reactions from scraped comments."
             ),
