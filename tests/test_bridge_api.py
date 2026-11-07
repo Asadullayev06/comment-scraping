@@ -1254,11 +1254,10 @@ async def test_bridge_youtube_video_analysis_option1_and_option2(bridge_client, 
     assert data1["grounded"] is True
     assert data1["video"]["video_id"] == "dQw4w9WgXcQ"
     assert data1["video"]["url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    assert data1["transcript"]["available"] is False
-    assert data1["transcript"]["extraction_engine"] == "gemini"
-    assert "direct video understanding" in data1["transcript"]["unavailable_reason"]
+    assert data1["transcript"]["available"] is True
+    assert data1["transcript"]["language"] == "uz"
     assert data1["analysis"]["grounded"] is True
-    assert data1["analysis"]["summary_source"] == "gemini_video"
+    assert data1["analysis"]["summary_source"] == "transcript"
     assert data1["analysis"]["on_topic"] is True
     assert "summary" in data1["analysis"]
     assert "key_moments" in data1["analysis"]
@@ -1348,6 +1347,24 @@ async def test_bridge_video_gemini_direct_youtube_url_call(bridge_client, monkey
     monkeypatch.setattr(settings, "GEMINI_API_KEY", "AIzaSyTestGeminiKey123")
     monkeypatch.setattr(settings, "GEMINI_MODEL", "gemini-3.8-flash")
     monkeypatch.setattr(YouTubeCollector, "fetch_video_metadata", mock_fetch_video_metadata)
+
+    async def mock_fetch_fast_transcript_unavailable(self, video_id: str, preferred_langs=None):
+        return {
+            "available": False,
+            "extraction_engine": None,
+            "playability_status": None,
+            "playability_reason": None,
+            "unavailable_reason": None,
+            "language": None,
+            "language_name": None,
+            "is_auto_generated": False,
+            "available_languages": [],
+            "segment_count": 0,
+            "full_text": "",
+            "segments": [],
+        }
+
+    monkeypatch.setattr(YouTubeCollector, "fetch_fast_transcript", mock_fetch_fast_transcript_unavailable)
     monkeypatch.setattr(httpx.AsyncClient, "post", mock_httpx_post)
 
     resp = await bridge_client.post(
@@ -1372,6 +1389,9 @@ async def test_bridge_video_gemini_direct_youtube_url_call(bridge_client, monkey
     assert sent_req["params"]["key"] == "AIzaSyTestGeminiKey123"
     parts = sent_req["json"]["contents"][0]["parts"]
     assert parts[0]["file_data"]["file_uri"] == "https://www.youtube.com/watch?v=aircAruvnKk"
+    gen_cfg = sent_req["json"]["generationConfig"]
+    assert gen_cfg["thinkingConfig"] == {"thinkingBudget": 0}
+    assert gen_cfg["mediaResolution"] == "MEDIA_RESOLUTION_LOW"
 
 
 def test_parse_youtube_timedtext_vtt():

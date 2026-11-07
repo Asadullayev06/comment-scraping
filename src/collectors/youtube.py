@@ -1059,6 +1059,212 @@ class YouTubeCollector(BaseCollector):
 
         return video_meta
 
+    async def fetch_fast_transcript(
+        self,
+        video_id: str,
+        preferred_langs: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Fast (< 3.5s) caption fetcher using youtube-transcript-api or single-shot InnerTube timedtext.
+
+        Never runs slow Playwright or multi-client loops; if captions are blocked or unavailable,
+        returns available=False immediately so Gemini can use its optimized file_uri fallback.
+        """
+        vid = str(video_id).strip()
+        langs = [l.strip().lower() for l in (preferred_langs or ["uz", "ru", "en", "tr", "az", "kk"]) if l.strip()]
+
+        empty_result: Dict[str, Any] = {
+            "available": False,
+            "extraction_engine": None,
+            "playability_status": None,
+            "playability_reason": None,
+            "unavailable_reason": None,
+            "language": None,
+            "language_name": None,
+            "is_auto_generated": False,
+            "available_languages": [],
+            "segment_count": 0,
+            "full_text": "",
+            "segments": [],
+        }
+
+        cookies: Dict[str, str] = {}
+        proxy_url: Optional[str] = None
+        if self.pool_manager:
+            try:
+                session_tuple = await self.pool_manager.acquire_session("youtube")
+                if session_tuple:
+                    _, s_cookies, s_proxy = session_tuple
+                    if isinstance(s_cookies, dict):
+                        cookies = {str(k): str(v) for k, v in s_cookies.items() if v is not None}
+                    proxy_url = s_proxy
+            except Exception:
+                pass
+
+        # 1. Try youtube-transcript-api first (fast, lightweight HTTP)
+        def _sync_yt_transcript_api() -> Optional[Dict[str, Any]]:
+            try:
+                from youtube_transcript_api import YouTubeTranscriptApi
+            except ImportError:
+                return None
+
+            try:
+                raw_items = None
+                detected_lang = None
+                is_auto = False
+
+                # Support both youtube-transcript-api >= 1.0 (instance .fetch/.list) and 0.6.x (class .list_transcripts/.get_transcript)
+                if hasattr(YouTubeTranscriptApi, "list_transcripts"):
+                    t_list = YouTubeTranscriptApi.list_transcripts(vid)
+                    chosen = None
+                    try:
+                        chosen = t_list.find_transcript(langs)
+                    except Exception:
+                        for tr in t_list:
+                            chosen = tr
+                            break
+                    if chosen is not None:
+                        detected_lang = getattr(chosen, "language_code", None)
+                        is_auto = bool(getattr(chosen, "is_generated", False))
+                        raw_items = chosen.fetch()
+                else:
+                    ytt = YouTubeTranscriptApi()
+                    if hasattr(ytt, "list"):
+                        t_list = ytt.list(vid)
+                        chosen = None
+                        try:
+                            chosen = t_list.find_transcript(langs)
+                        except Exception:
+                            for tr in t_list:
+                                chosen = tr
+                                break
+                        if chosen is not None:
+                            detected_lang = getattr(chosen, "language_code", None)
+                            is_auto = bool(getattr(chosen, "is_generated", False))
+                            raw_items = chosen.fetch()
+                    elif hasattr(ytt, "fetch"):
+                        raw_items = ytt.fetch(vid, languages=langs)
+
+                if not raw_items:
+                    return None
+
+                segments: List[Dict[str, Any]] = []
+                for item in raw_items:
+                    if isinstance(item, dict):
+                        start_s = float(item.get("start") or 0.0)
+                        dur_s = float(item.get("duration") or 0.0)
+                        txt = str(item.get("text") or "").strip()
+                    else:
+                        start_s = float(getattr(item, "start", 0.0) or 0.0)
+                        dur_s = float(getattr(item, "duration", 0.0) or 0.0)
+                        txt = str(getattr(item, "text", "") or "").strip()
+                    if not txt:
+                        continue
+                    segments.append(
+                        {
+                            "timestamp": format_seconds_to_timestamp(int(start_s)),
+                            "start": round(start_s, 2),
+                            "duration": round(dur_s, 2),
+                            "text": txt,
+                        }
+                    )
+                if not segments:
+                    return None
+
+                full_text = "\n".join(f"[{s['timestamp']}] {s['text']}" for s in segments)
+                return {
+                    "available": True,
+                    "extraction_engine": "youtube_transcript_api",
+                    "playability_status": "OK",
+                    "playability_reason": None,
+                    "unavailable_reason": None,
+                    "language": detected_lang or "auto",
+                    "language_name": detected_lang or "auto",
+                    "is_auto_generated": is_auto,
+                    "available_languages": [],
+                    "segment_count": len(segments),
+                    "full_text": full_text,
+                    "segments": segments,
+                }
+            except Exception:
+                return None
+
+        try:
+            yta_res = await asyncio.wait_for(asyncio.to_thread(_sync_yt_transcript_api), timeout=3.0)
+            if yta_res and yta_res.get("available"):
+                return yta_res
+        except Exception:
+            pass
+
+        # 2. Fast single-shot InnerTube ANDROID player timedtext check (2.5s timeout)
+        try:
+            transport = httpx.AsyncHTTPTransport(proxy=proxy_url) if proxy_url else None
+            async with httpx.AsyncClient(timeout=2.5, follow_redirects=True, transport=transport, cookies=cookies) as fast_client:
+                player_resp = await fast_client.post(
+                    "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                    json={
+                        "context": {
+                            "client": {
+                                "clientName": "ANDROID",
+                                "clientVersion": "20.10.38",
+                                "androidSdkVersion": 34,
+                                "hl": "en",
+                                "gl": "US",
+                            }
+                        },
+                        "videoId": vid,
+                        "contentCheckOk": True,
+                        "racyCheckOk": True,
+                    },
+                    headers={"User-Agent": YT_ANDROID_UA, "Content-Type": "application/json"},
+                )
+                if player_resp.status_code == 200:
+                    pdata = player_resp.json() or {}
+                    tracks = (
+                        (pdata.get("captions") or {})
+                        .get("playerCaptionsTracklistRenderer", {})
+                        .get("captionTracks")
+                        or []
+                    )
+                    if tracks:
+                        def _rank_tr(t: Dict[str, Any]) -> Tuple[int, int]:
+                            code = str(t.get("languageCode") or "").lower()
+                            base_c = code.split("-")[0]
+                            idx = 999
+                            for i, pref in enumerate(langs):
+                                if code == pref or base_c == pref:
+                                    idx = i
+                                    break
+                            return (idx, 1 if t.get("kind") == "asr" else 0)
+
+                        best = sorted(tracks, key=_rank_tr)[0]
+                        base_url = best.get("baseUrl")
+                        if base_url:
+                            tt_url = f"{base_url}&fmt=json3" if "fmt=" not in base_url else base_url
+                            tt_resp = await fast_client.get(tt_url)
+                            if tt_resp.status_code == 200 and tt_resp.text.strip():
+                                segs = parse_youtube_timedtext(tt_resp.text)
+                                if segs:
+                                    lang_code = best.get("languageCode") or "auto"
+                                    full_text = "\n".join(f"[{s['timestamp']}] {s['text']}" for s in segs)
+                                    return {
+                                        "available": True,
+                                        "extraction_engine": "innertube_timedtext",
+                                        "playability_status": "OK",
+                                        "playability_reason": None,
+                                        "unavailable_reason": None,
+                                        "language": lang_code,
+                                        "language_name": lang_code,
+                                        "is_auto_generated": best.get("kind") == "asr",
+                                        "available_languages": [],
+                                        "segment_count": len(segs),
+                                        "full_text": full_text,
+                                        "segments": segs,
+                                    }
+        except Exception:
+            pass
+
+        return empty_result
+
     async def fetch_video_details_and_transcript(
         self,
         video_id: str,

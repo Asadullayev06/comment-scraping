@@ -2300,6 +2300,8 @@ async def handle_video(request: web.Request) -> web.Response:
     ).strip() or None
     limit = min(max(10, int(body.get("limit") or request.query.get("limit") or 100)), 500)
     post_index = max(1, int(body.get("post_index") or request.query.get("post_index") or 1))
+    lang_str = (body.get("lang") or request.query.get("lang") or "").strip()
+    preferred_langs = [l.strip() for l in lang_str.split(",") if l.strip()] if lang_str else None
 
     yt_collector = YouTubeCollector()
     try:
@@ -2337,16 +2339,27 @@ async def handle_video(request: web.Request) -> web.Response:
                 status=400,
             )
 
-        # Fetch lightweight video metadata (no local transcript scraping — Gemini reads the YouTube URL directly)
+        # 1. Fast Transcript First + Video Metadata in parallel (< 3.5s)
         if getattr(YouTubeCollector.fetch_video_details_and_transcript, "__name__", "") != "fetch_video_details_and_transcript":
-            video_bundle = await yt_collector.fetch_video_details_and_transcript(video_id=video_id)
+            video_bundle = await yt_collector.fetch_video_details_and_transcript(
+                video_id=video_id,
+                preferred_langs=preferred_langs,
+            )
             video_meta = video_bundle.get("video") or await yt_collector.fetch_video_metadata(video_id)
+            transcript_info = video_bundle.get("transcript") or {"available": False}
         else:
-            video_meta = await yt_collector.fetch_video_metadata(video_id)
+            async with async_session_factory() as yt_sess_db:
+                yt_collector.pool_manager = SessionPoolManager(yt_sess_db)
+                video_meta, transcript_info = await asyncio.gather(
+                    yt_collector.fetch_video_metadata(video_id),
+                    yt_collector.fetch_fast_transcript(video_id, preferred_langs=preferred_langs),
+                )
+                yt_collector.pool_manager = None
 
         clean_video_url = f"https://www.youtube.com/watch?v={video_id}"
         video_meta["video_id"] = video_id
         video_meta["url"] = clean_video_url
+        has_fast_transcript = bool(transcript_info.get("available") and (transcript_info.get("full_text") or "").strip())
 
         comment_stats: Optional[Dict[str, Any]] = None
         flagged_comments: List[Dict[str, Any]] = []
@@ -2447,7 +2460,7 @@ async def handle_video(request: web.Request) -> web.Response:
                     "score_distribution": dist,
                 }
 
-        # Pass YouTube URL directly to Google Gemini API
+        # Pass plain text transcript (fast ~2-3s path) or YouTube URL (optimized file_uri fallback) to Gemini API
         from src.llm.client import DeepSeekClassifier
 
         classifier = DeepSeekClassifier()
@@ -2465,6 +2478,10 @@ async def handle_video(request: web.Request) -> web.Response:
                 "like_count": video_meta.get("like_count"),
                 "comment_count": video_meta.get("comment_count"),
             },
+            "transcript_available": has_fast_transcript,
+            "transcript_language": transcript_info.get("language_name") or transcript_info.get("language"),
+            "transcript_text": (transcript_info.get("full_text") or "")[:24000] if has_fast_transcript else "",
+            "transcript_segments": (transcript_info.get("segments") or [])[:40] if has_fast_transcript else [],
         }
         if effective_mode == "reactions":
             llm_payload["comment_stats"] = comment_stats
@@ -2483,15 +2500,19 @@ async def handle_video(request: web.Request) -> web.Response:
         if not focus:
             analysis_result["on_topic"] = True
 
-        # Grounding contract: Gemini direct video understanding sets grounded=True, summary_source="gemini_video";
-        # fallback path preserves metadata_only / False.
+        # Grounding contract:
+        # - Fast transcript path -> grounded=True, summary_source="transcript"
+        # - Gemini direct video understanding -> grounded=True, summary_source="gemini_video"
+        # - Fallback metadata-only -> grounded=False, summary_source="metadata_only"
         is_fallback = analysis_result.get("summary_source") == "metadata_only" or analysis_result.get("grounded") is False
         is_grounded = not is_fallback
         analysis_result["grounded"] = is_grounded
-        analysis_result["summary_source"] = "gemini_video" if is_grounded else "metadata_only"
         if not is_grounded:
+            analysis_result["summary_source"] = "metadata_only"
             analysis_result["key_moments"] = []
             analysis_result["claims_and_allegations"] = []
+        else:
+            analysis_result["summary_source"] = "transcript" if has_fast_transcript else "gemini_video"
 
         compact_video_meta = {
             "video_id": video_id,
@@ -2505,24 +2526,40 @@ async def handle_video(request: web.Request) -> web.Response:
             "comment_count": video_meta.get("comment_count"),
         }
 
-        transcript_stub: Dict[str, Any] = {
-            "available": False,
-            "extraction_engine": "gemini" if is_grounded else None,
-            "playability_status": "OK" if is_grounded else None,
-            "playability_reason": None,
-            "unavailable_reason": (
-                "analysis performed via direct video understanding; no transcript requested"
-                if is_grounded
-                else "Gemini video analysis unavailable; fallback used metadata only"
-            ),
-            "language": analysis_result.get("language"),
-            "language_name": analysis_result.get("language"),
-            "is_auto_generated": False,
-            "available_languages": [],
-            "segment_count": 0,
-            "full_text": "",
-            "segments": [],
-        }
+        if has_fast_transcript:
+            transcript_stub: Dict[str, Any] = {
+                "available": True,
+                "extraction_engine": transcript_info.get("extraction_engine") or "youtube_transcript_api",
+                "playability_status": "OK",
+                "playability_reason": None,
+                "unavailable_reason": None,
+                "language": transcript_info.get("language") or analysis_result.get("language"),
+                "language_name": transcript_info.get("language_name") or analysis_result.get("language"),
+                "is_auto_generated": bool(transcript_info.get("is_auto_generated")),
+                "available_languages": transcript_info.get("available_languages") or [],
+                "segment_count": int(transcript_info.get("segment_count") or 0),
+                "full_text": "",
+                "segments": [],
+            }
+        else:
+            transcript_stub = {
+                "available": False,
+                "extraction_engine": "gemini" if is_grounded else None,
+                "playability_status": "OK" if is_grounded else None,
+                "playability_reason": None,
+                "unavailable_reason": (
+                    "analysis performed via direct video understanding; no transcript requested"
+                    if is_grounded
+                    else "Gemini video analysis unavailable; fallback used metadata only"
+                ),
+                "language": analysis_result.get("language"),
+                "language_name": analysis_result.get("language"),
+                "is_auto_generated": False,
+                "available_languages": [],
+                "segment_count": 0,
+                "full_text": "",
+                "segments": [],
+            }
 
         response_data: Dict[str, Any] = {
             "status": "completed",
@@ -2545,7 +2582,11 @@ async def handle_video(request: web.Request) -> web.Response:
                     audience_reaction["reactions_by_video_part"] = (
                         audience_reaction["reactions_by_video_part"][:4] if is_grounded else []
                     )
-                audience_reaction["source"] = "gemini_video" if is_grounded else "comment-derived, not video-correlated"
+                audience_reaction["source"] = (
+                    "transcript-correlated"
+                    if (is_grounded and has_fast_transcript)
+                    else ("gemini_video" if is_grounded else "comment-derived, not video-correlated")
+                )
             response_data["audience_reaction"] = audience_reaction
             response_data["comment_stats"] = comment_stats
             response_data["flagged_comments"] = flagged_comments[:10]

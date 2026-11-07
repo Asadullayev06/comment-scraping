@@ -158,9 +158,9 @@ class DeepSeekClassifier:
     async def analyze_video(
         self,
         video_payload: Dict[str, Any],
-        max_retries: int = 3,
+        max_retries: int = 1,
     ) -> Dict[str, Any]:
-        """Analyze a YouTube video directly via the Google Gemini API by passing the YouTube URL in file_data."""
+        """Analyze a YouTube video via Google Gemini: fast text-transcript first (~2-3s), or optimized file_uri fallback (thinkingBudget=0, MEDIA_RESOLUTION_LOW)."""
         gemini_key = (self.gemini_api_key or settings.GEMINI_API_KEY or "").strip()
 
         # Offline mock mode for unit tests
@@ -184,7 +184,9 @@ class DeepSeekClassifier:
         if not youtube_url:
             raise ScraperError("invalid video url", "Missing YouTube video URL for Gemini analysis", status_code=400)
 
-        # Build compact context payload for Gemini (no bloated local transcripts)
+        transcript_text = (video_payload.get("transcript_text") or "").strip()
+        has_transcript = bool(video_payload.get("transcript_available") and transcript_text)
+
         compact_context: Dict[str, Any] = {
             "mode": video_payload.get("mode") or "video",
             "focus": video_payload.get("focus"),
@@ -200,14 +202,41 @@ class DeepSeekClassifier:
                 "comment_count": v_meta.get("comment_count"),
             },
         }
+        if has_transcript:
+            compact_context["transcript_language"] = video_payload.get("transcript_language")
+            compact_context["transcript_text"] = transcript_text[:24000]
         if compact_context["mode"] == "reactions":
             compact_context["comment_stats"] = video_payload.get("comment_stats")
             compact_context["comments"] = (video_payload.get("comments") or [])[:50]
 
-        user_prompt_text = (
-            "Watch and analyze this YouTube video directly, then return the compact JSON intelligence report.\n"
-            f"Context JSON:\n{json.dumps(compact_context, ensure_ascii=False)}"
-        )
+        if has_transcript:
+            user_prompt_text = (
+                "Analyze this YouTube video using the provided timestamped transcript and metadata, then return the compact JSON intelligence report.\n"
+                f"Context JSON:\n{json.dumps(compact_context, ensure_ascii=False)}"
+            )
+            parts_list: List[Dict[str, Any]] = [{"text": user_prompt_text}]
+            gen_config: Dict[str, Any] = {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingBudget": 0},
+            }
+            req_timeout = 30.0
+        else:
+            user_prompt_text = (
+                "Watch and analyze this YouTube video directly, then return the compact JSON intelligence report.\n"
+                f"Context JSON:\n{json.dumps(compact_context, ensure_ascii=False)}"
+            )
+            parts_list = [
+                {"file_data": {"file_uri": youtube_url}},
+                {"text": user_prompt_text},
+            ]
+            gen_config = {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingBudget": 0},
+                "mediaResolution": "MEDIA_RESOLUTION_LOW",
+            }
+            req_timeout = 90.0
 
         endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent"
         req_body = {
@@ -217,102 +246,77 @@ class DeepSeekClassifier:
             "contents": [
                 {
                     "role": "user",
-                    "parts": [
-                        {
-                            "file_data": {
-                                "file_uri": youtube_url,
-                            }
-                        },
-                        {
-                            "text": user_prompt_text,
-                        },
-                    ],
+                    "parts": parts_list,
                 }
             ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "responseMimeType": "application/json",
-            },
+            "generationConfig": gen_config,
         }
 
-        attempt = 0
-        backoff = 1.5
-        last_error: Optional[str] = None
-
-        async with httpx.AsyncClient(timeout=120.0) as http_client:
-            while attempt < max_retries:
-                attempt += 1
-                try:
-                    resp = await http_client.post(
-                        endpoint,
-                        params={"key": gemini_key},
-                        json=req_body,
-                        headers={"Content-Type": "application/json"},
+        async with httpx.AsyncClient(timeout=req_timeout) as http_client:
+            try:
+                resp = await http_client.post(
+                    endpoint,
+                    params={"key": gemini_key},
+                    json=req_body,
+                    headers={"Content-Type": "application/json"},
+                )
+                if resp.status_code != 200:
+                    err_detail = resp.text[:400]
+                    try:
+                        err_json = resp.json()
+                        err_detail = (err_json.get("error") or {}).get("message") or err_detail
+                    except Exception:
+                        pass
+                    logger.error(
+                        "Gemini video analysis HTTP error",
+                        status_code=resp.status_code,
+                        mode="transcript" if has_transcript else "file_uri",
+                        error=err_detail,
                     )
-                    if resp.status_code != 200:
-                        err_detail = resp.text[:400]
-                        try:
-                            err_json = resp.json()
-                            err_detail = (err_json.get("error") or {}).get("message") or err_detail
-                        except Exception:
-                            pass
-                        last_error = f"HTTP {resp.status_code}: {err_detail}"
-                        logger.error(
-                            "Gemini video analysis HTTP error",
-                            status_code=resp.status_code,
-                            attempt=attempt,
-                            error=err_detail,
-                        )
-                        if resp.status_code in (400, 401, 403, 404):
-                            raise ScraperError(
-                                "gemini api error",
-                                f"Gemini API error ({resp.status_code}): {err_detail}",
-                                status_code=resp.status_code if resp.status_code != 404 else 502,
-                            )
-                        if attempt >= max_retries:
-                            raise ScraperError(
-                                "gemini api error",
-                                f"Gemini API failed after {max_retries} attempts: {last_error}",
-                                status_code=502,
-                            )
-                        await asyncio.sleep(backoff)
-                        backoff *= 2.0
-                        continue
+                    raise ScraperError(
+                        "gemini api error",
+                        f"Gemini API error ({resp.status_code}): {err_detail}",
+                        status_code=resp.status_code if resp.status_code in (400, 401, 403, 429) else 502,
+                    )
 
-                    data = resp.json() or {}
-                    candidates = data.get("candidates") or []
-                    if not candidates:
-                        prompt_feedback = data.get("promptFeedback") or {}
-                        block_reason = prompt_feedback.get("blockReason") or "No candidates returned by Gemini"
-                        raise ScraperError(
-                            "gemini blocked or empty",
-                            f"Gemini returned no analysis candidates ({block_reason})",
-                            status_code=502,
-                        )
+                data = resp.json() or {}
+                candidates = data.get("candidates") or []
+                if not candidates:
+                    prompt_feedback = data.get("promptFeedback") or {}
+                    block_reason = prompt_feedback.get("blockReason") or "No candidates returned by Gemini"
+                    raise ScraperError(
+                        "gemini blocked or empty",
+                        f"Gemini returned no analysis candidates ({block_reason})",
+                        status_code=502,
+                    )
 
-                    parts = ((candidates[0].get("content") or {}).get("parts")) or []
-                    raw_text = "".join(str(p.get("text") or "") for p in parts if isinstance(p, dict))
-                    clean_json_str = _strip_json_fences(raw_text) or "{}"
-                    parsed_json = json.loads(clean_json_str)
-                    if not isinstance(parsed_json, dict):
-                        parsed_json = {}
-                    return parsed_json
+                parts = ((candidates[0].get("content") or {}).get("parts")) or []
+                raw_text = "".join(str(p.get("text") or "") for p in parts if isinstance(p, dict))
+                clean_json_str = _strip_json_fences(raw_text) or "{}"
+                parsed_json = json.loads(clean_json_str)
+                if not isinstance(parsed_json, dict):
+                    parsed_json = {}
+                parsed_json["grounded"] = True
+                parsed_json["summary_source"] = "transcript" if has_transcript else "gemini_video"
+                return parsed_json
 
-                except ScraperError:
-                    raise
-                except Exception as exc:
-                    last_error = str(exc)
-                    logger.error("Gemini video analysis attempt failed", attempt=attempt, error=last_error)
-                    if attempt >= max_retries:
-                        raise ScraperError(
-                            "gemini api error",
-                            f"Gemini video analysis failed: {last_error}",
-                            status_code=502,
-                        )
-                    await asyncio.sleep(backoff)
-                    backoff *= 2.0
-
-        raise ScraperError("gemini api error", f"Gemini video analysis failed: {last_error}", status_code=502)
+            except ScraperError:
+                raise
+            except httpx.TimeoutException as t_exc:
+                # Never retry timed-out video calls in a loop
+                logger.error("Gemini video analysis timed out", error=str(t_exc))
+                raise ScraperError(
+                    "gemini timeout",
+                    f"Gemini video analysis timed out after {int(req_timeout)}s",
+                    status_code=504,
+                )
+            except Exception as exc:
+                logger.error("Gemini video analysis failed", error=str(exc))
+                raise ScraperError(
+                    "gemini api error",
+                    f"Gemini video analysis failed: {exc}",
+                    status_code=502,
+                )
 
     def _heuristic_mock_analyze_video(self, video_payload: Dict[str, Any]) -> Dict[str, Any]:
         """Offline fallback video analyzer for unit tests or unconfigured API key."""
