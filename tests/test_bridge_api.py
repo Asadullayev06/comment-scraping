@@ -1251,9 +1251,15 @@ async def test_bridge_youtube_video_analysis_option1_and_option2(bridge_client, 
     assert data1["mode"] == "video"
     assert data1["provider"] == "gemini"
     assert data1["model"] == bridge_mod.settings.GEMINI_MODEL
+    assert data1["grounded"] is True
     assert data1["video"]["video_id"] == "dQw4w9WgXcQ"
     assert data1["video"]["url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    assert "transcript" not in data1
+    assert data1["transcript"]["available"] is False
+    assert data1["transcript"]["extraction_engine"] == "gemini"
+    assert "direct video understanding" in data1["transcript"]["unavailable_reason"]
+    assert data1["analysis"]["grounded"] is True
+    assert data1["analysis"]["summary_source"] == "gemini_video"
+    assert data1["analysis"]["on_topic"] is True
     assert "summary" in data1["analysis"]
     assert "key_moments" in data1["analysis"]
     assert "audience_reaction" not in data1
@@ -1352,6 +1358,11 @@ async def test_bridge_video_gemini_direct_youtube_url_call(bridge_client, monkey
     data = await resp.json()
     assert data["provider"] == "gemini"
     assert data["model"] == "gemini-3.8-flash"
+    assert data["grounded"] is True
+    assert data["transcript"]["available"] is False
+    assert data["transcript"]["extraction_engine"] == "gemini"
+    assert data["analysis"]["grounded"] is True
+    assert data["analysis"]["summary_source"] == "gemini_video"
     assert data["focus"] == "What is said about tariffs?"
     assert data["analysis"]["language"] == "uz"
     assert data["analysis"]["focused_answer"] == "The speaker argues at [12:30] that tariff increases need stronger oversight."

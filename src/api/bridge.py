@@ -2479,6 +2479,20 @@ async def handle_video(request: web.Request) -> web.Response:
         if isinstance(analysis_result.get("claims_and_allegations"), list):
             analysis_result["claims_and_allegations"] = analysis_result["claims_and_allegations"][:5]
 
+        # When no --focus query is supplied, default on_topic to True
+        if not focus:
+            analysis_result["on_topic"] = True
+
+        # Grounding contract: Gemini direct video understanding sets grounded=True, summary_source="gemini_video";
+        # fallback path preserves metadata_only / False.
+        is_fallback = analysis_result.get("summary_source") == "metadata_only" or analysis_result.get("grounded") is False
+        is_grounded = not is_fallback
+        analysis_result["grounded"] = is_grounded
+        analysis_result["summary_source"] = "gemini_video" if is_grounded else "metadata_only"
+        if not is_grounded:
+            analysis_result["key_moments"] = []
+            analysis_result["claims_and_allegations"] = []
+
         compact_video_meta = {
             "video_id": video_id,
             "url": clean_video_url,
@@ -2491,13 +2505,34 @@ async def handle_video(request: web.Request) -> web.Response:
             "comment_count": video_meta.get("comment_count"),
         }
 
+        transcript_stub: Dict[str, Any] = {
+            "available": False,
+            "extraction_engine": "gemini" if is_grounded else None,
+            "playability_status": "OK" if is_grounded else None,
+            "playability_reason": None,
+            "unavailable_reason": (
+                "analysis performed via direct video understanding; no transcript requested"
+                if is_grounded
+                else "Gemini video analysis unavailable; fallback used metadata only"
+            ),
+            "language": analysis_result.get("language"),
+            "language_name": analysis_result.get("language"),
+            "is_auto_generated": False,
+            "available_languages": [],
+            "segment_count": 0,
+            "full_text": "",
+            "segments": [],
+        }
+
         response_data: Dict[str, Any] = {
             "status": "completed",
-            "provider": "gemini",
+            "provider": "gemini" if is_grounded else "fallback",
             "model": classifier.gemini_model,
             "mode": effective_mode,
             "focus": focus,
+            "grounded": is_grounded,
             "video": compact_video_meta,
+            "transcript": transcript_stub,
             "analysis": analysis_result,
         }
         if resolved_from_channel:
@@ -2505,8 +2540,12 @@ async def handle_video(request: web.Request) -> web.Response:
             response_data["post_index"] = post_index
 
         if effective_mode == "reactions":
-            if isinstance(audience_reaction, dict) and isinstance(audience_reaction.get("reactions_by_video_part"), list):
-                audience_reaction["reactions_by_video_part"] = audience_reaction["reactions_by_video_part"][:4]
+            if isinstance(audience_reaction, dict):
+                if isinstance(audience_reaction.get("reactions_by_video_part"), list):
+                    audience_reaction["reactions_by_video_part"] = (
+                        audience_reaction["reactions_by_video_part"][:4] if is_grounded else []
+                    )
+                audience_reaction["source"] = "gemini_video" if is_grounded else "comment-derived, not video-correlated"
             response_data["audience_reaction"] = audience_reaction
             response_data["comment_stats"] = comment_stats
             response_data["flagged_comments"] = flagged_comments[:10]

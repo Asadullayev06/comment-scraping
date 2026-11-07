@@ -200,7 +200,7 @@ Respond with a single valid JSON object matching this exact structure:
 {
   "summary": "<concise 2-4 sentence executive summary of the video's subject, speakers, and core message>",
   "language": "<detected primary language(s) of the video>",
-  "on_topic": true | false,
+  "on_topic": "<boolean: true if the video addresses the operator's 'focus' query (or true by default when 'focus' is null)>",
   "severity_score": <integer 0 to 10>,
   "severely_negative": true | false,
   "tone_and_stance": "<characterization of the video's tone and stance, e.g. 'Neutral news reporting', 'Critical investigative commentary', 'Hostile anti-government rhetoric'>",
