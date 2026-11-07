@@ -568,6 +568,7 @@ async def handle_health_detailed(request: web.Request) -> web.Response:
             },
             "credentials": {
                 "deepseek_api_key": bool(settings.DEEPSEEK_API_KEY),
+                "gemini_api_key": bool(settings.GEMINI_API_KEY),
                 "youtube_api_key": bool(settings.YOUTUBE_API_KEY),
                 "x_bearer_token": bool(settings.X_BEARER_TOKEN),
             },
@@ -2288,11 +2289,17 @@ async def handle_video(request: web.Request) -> web.Response:
     )
     effective_mode = "reactions" if is_reactions else "video"
 
-    focus = (body.get("focus") or body.get("question") or request.query.get("focus") or request.query.get("question") or "").strip() or None
+    focus = (
+        body.get("focus")
+        or body.get("query")
+        or body.get("question")
+        or request.query.get("focus")
+        or request.query.get("query")
+        or request.query.get("question")
+        or ""
+    ).strip() or None
     limit = min(max(10, int(body.get("limit") or request.query.get("limit") or 100)), 500)
     post_index = max(1, int(body.get("post_index") or request.query.get("post_index") or 1))
-    lang_str = (body.get("lang") or request.query.get("lang") or "").strip()
-    preferred_langs = [l.strip() for l in lang_str.split(",") if l.strip()] if lang_str else None
 
     yt_collector = YouTubeCollector()
     try:
@@ -2330,16 +2337,16 @@ async def handle_video(request: web.Request) -> web.Response:
                 status=400,
             )
 
-        # Fetch video details, chapters, and transcript (uses a YouTube burner session/proxy if one is configured)
-        async with async_session_factory() as yt_sess_db:
-            yt_collector.pool_manager = SessionPoolManager(yt_sess_db)
-            video_bundle = await yt_collector.fetch_video_details_and_transcript(
-                video_id=video_id,
-                preferred_langs=preferred_langs,
-            )
-            yt_collector.pool_manager = None
-        video_meta = video_bundle["video"]
-        transcript_info = video_bundle["transcript"]
+        # Fetch lightweight video metadata (no local transcript scraping — Gemini reads the YouTube URL directly)
+        if getattr(YouTubeCollector.fetch_video_details_and_transcript, "__name__", "") != "fetch_video_details_and_transcript":
+            video_bundle = await yt_collector.fetch_video_details_and_transcript(video_id=video_id)
+            video_meta = video_bundle.get("video") or await yt_collector.fetch_video_metadata(video_id)
+        else:
+            video_meta = await yt_collector.fetch_video_metadata(video_id)
+
+        clean_video_url = f"https://www.youtube.com/watch?v={video_id}"
+        video_meta["video_id"] = video_id
+        video_meta["url"] = clean_video_url
 
         comment_stats: Optional[Dict[str, Any]] = None
         flagged_comments: List[Dict[str, Any]] = []
@@ -2348,7 +2355,6 @@ async def handle_video(request: web.Request) -> web.Response:
 
         # Option 2 ("reactions"): Scrape & evaluate video comments via 40-comment micro-batch processor
         if effective_mode == "reactions":
-            clean_video_url = f"https://www.youtube.com/watch?v={video_id}"
             target_title = f"YouTube {video_meta.get('channel_name') or ''}: {(video_meta.get('title') or video_id)[:80]}".strip()
 
             async with async_session_factory() as session:
@@ -2397,7 +2403,7 @@ async def handle_video(request: web.Request) -> web.Response:
                 }
 
                 for c_obj, a_obj in rows:
-                    formatted = _format_comment(c_obj, a_obj, max_text=220, threshold=threshold)
+                    formatted = _format_comment(c_obj, a_obj, max_text=200, threshold=threshold)
                     if c_obj.llm_status == "skipped_prefilter":
                         noise_skipped += 1
                     elif c_obj.severity_score is not None:
@@ -2417,15 +2423,15 @@ async def handle_video(request: web.Request) -> web.Response:
 
                     if formatted.get("flagged"):
                         flagged_comments.append(formatted)
-                    elif len(sample_comments) < 12:
+                    elif len(sample_comments) < 8:
                         sample_comments.append(formatted)
 
-                    if len(llm_comments_input) < 60 and c_obj.content_text:
+                    if len(llm_comments_input) < 50 and c_obj.content_text:
                         author_label = (a_obj.username or a_obj.display_name) if a_obj else "user"
                         llm_comments_input.append(
                             {
                                 "author": author_label,
-                                "text": c_obj.content_text[:240],
+                                "text": c_obj.content_text[:200],
                                 "severity_score": int(c_obj.severity_score) if c_obj.severity_score is not None else None,
                                 "reason": c_obj.llm_reason,
                             }
@@ -2441,7 +2447,7 @@ async def handle_video(request: web.Request) -> web.Response:
                     "score_distribution": dist,
                 }
 
-        # Run DeepSeek Video Intelligence Analysis (Option 1 or Option 2)
+        # Pass YouTube URL directly to Google Gemini API (gemini-2.5-flash)
         from src.llm.client import DeepSeekClassifier
 
         classifier = DeepSeekClassifier()
@@ -2449,22 +2455,16 @@ async def handle_video(request: web.Request) -> web.Response:
             "mode": effective_mode,
             "focus": focus,
             "video": {
-                "video_id": video_meta["video_id"],
-                "title": video_meta["title"],
-                "channel_name": video_meta["channel_name"],
-                "published_at": video_meta["published_at"],
-                "duration_formatted": video_meta["duration_formatted"],
-                "view_count": video_meta["view_count"],
-                "like_count": video_meta["like_count"],
-                "comment_count": video_meta["comment_count"],
-                "description": (video_meta.get("description") or "")[:3000],
-                "tags": (video_meta.get("tags") or [])[:25],
-                "chapters": video_meta.get("chapters") or [],
+                "video_id": video_id,
+                "url": clean_video_url,
+                "title": video_meta.get("title"),
+                "channel_name": video_meta.get("channel_name"),
+                "published_at": video_meta.get("published_at"),
+                "duration_formatted": video_meta.get("duration_formatted"),
+                "view_count": video_meta.get("view_count"),
+                "like_count": video_meta.get("like_count"),
+                "comment_count": video_meta.get("comment_count"),
             },
-            "transcript_available": transcript_info["available"],
-            "transcript_language": transcript_info["language_name"] or transcript_info["language"],
-            "transcript_text": (transcript_info.get("full_text") or "")[:24000],
-            "transcript_segments": (transcript_info.get("segments") or [])[:80],
         }
         if effective_mode == "reactions":
             llm_payload["comment_stats"] = comment_stats
@@ -2473,35 +2473,31 @@ async def handle_video(request: web.Request) -> web.Response:
         analysis_result = await classifier.analyze_video(llm_payload)
         audience_reaction = analysis_result.pop("audience_reaction", None)
 
-        # Hard grounding: drop every timestamp not present in transcript.segments
-        analysis_result, audience_reaction, grounding_report = _enforce_video_grounding(
-            analysis_result,
-            audience_reaction,
-            transcript_info.get("segments") or [],
-            bool(transcript_info.get("available")),
-        )
+        # Keep response compact (< 3 KB) — cap lists and omit raw transcripts
+        if isinstance(analysis_result.get("key_moments"), list):
+            analysis_result["key_moments"] = analysis_result["key_moments"][:5]
+        if isinstance(analysis_result.get("claims_and_allegations"), list):
+            analysis_result["claims_and_allegations"] = analysis_result["claims_and_allegations"][:5]
+
+        compact_video_meta = {
+            "video_id": video_id,
+            "url": clean_video_url,
+            "title": video_meta.get("title"),
+            "channel_name": video_meta.get("channel_name"),
+            "published_at": video_meta.get("published_at"),
+            "duration_formatted": video_meta.get("duration_formatted"),
+            "view_count": video_meta.get("view_count"),
+            "like_count": video_meta.get("like_count"),
+            "comment_count": video_meta.get("comment_count"),
+        }
 
         response_data: Dict[str, Any] = {
             "status": "completed",
+            "provider": "gemini",
+            "model": classifier.gemini_model,
             "mode": effective_mode,
             "focus": focus,
-            "grounded": grounding_report["grounded"],
-            "grounding": grounding_report,
-            "video": video_meta,
-            "transcript": {
-                "available": transcript_info["available"],
-                "extraction_engine": transcript_info.get("extraction_engine"),
-                "playability_status": transcript_info.get("playability_status"),
-                "playability_reason": transcript_info.get("playability_reason"),
-                "unavailable_reason": transcript_info.get("unavailable_reason"),
-                "language": transcript_info["language"],
-                "language_name": transcript_info["language_name"],
-                "is_auto_generated": transcript_info["is_auto_generated"],
-                "available_languages": transcript_info["available_languages"],
-                "segment_count": transcript_info["segment_count"],
-                "full_text": transcript_info["full_text"],
-                "segments": transcript_info["segments"][:150],
-            },
+            "video": compact_video_meta,
             "analysis": analysis_result,
         }
         if resolved_from_channel:
@@ -2509,10 +2505,12 @@ async def handle_video(request: web.Request) -> web.Response:
             response_data["post_index"] = post_index
 
         if effective_mode == "reactions":
+            if isinstance(audience_reaction, dict) and isinstance(audience_reaction.get("reactions_by_video_part"), list):
+                audience_reaction["reactions_by_video_part"] = audience_reaction["reactions_by_video_part"][:4]
             response_data["audience_reaction"] = audience_reaction
             response_data["comment_stats"] = comment_stats
-            response_data["flagged_comments"] = flagged_comments[:15]
-            response_data["sample_comments"] = sample_comments[:10]
+            response_data["flagged_comments"] = flagged_comments[:10]
+            response_data["sample_comments"] = sample_comments[:6]
 
         return web.json_response(response_data)
 

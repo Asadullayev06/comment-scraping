@@ -1241,7 +1241,7 @@ async def test_bridge_youtube_video_analysis_option1_and_option2(bridge_client, 
     monkeypatch.setattr(YouTubeCollector, "fetch_video_details_and_transcript", mock_fetch_video_details_and_transcript)
     monkeypatch.setattr(YouTubeCollector, "fetch_comments", mock_fetch_comments)
 
-    # Option 1: Video-only analysis (mode="video")
+    # Option 1: Video-only analysis via Gemini (mode="video")
     resp1 = await bridge_client.post(
         "/api/video",
         json={"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "mode": "video"},
@@ -1249,9 +1249,11 @@ async def test_bridge_youtube_video_analysis_option1_and_option2(bridge_client, 
     assert resp1.status == 200
     data1 = await resp1.json()
     assert data1["mode"] == "video"
+    assert data1["provider"] == "gemini"
+    assert data1["model"] == "gemini-2.5-flash"
     assert data1["video"]["video_id"] == "dQw4w9WgXcQ"
-    assert data1["transcript"]["available"] is True
-    assert data1["transcript"]["language"] == "uz"
+    assert data1["video"]["url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert "transcript" not in data1
     assert "summary" in data1["analysis"]
     assert "key_moments" in data1["analysis"]
     assert "audience_reaction" not in data1
@@ -1269,6 +1271,7 @@ async def test_bridge_youtube_video_analysis_option1_and_option2(bridge_client, 
     assert resp2.status == 200
     data2 = await resp2.json()
     assert data2["mode"] == "reactions"
+    assert data2["provider"] == "gemini"
     assert data2["analysis"]["focused_answer"] is not None
     assert data2["audience_reaction"] is not None
     assert "overall_sentiment" in data2["audience_reaction"]
@@ -1277,103 +1280,86 @@ async def test_bridge_youtube_video_analysis_option1_and_option2(bridge_client, 
     assert data2["comment_stats"]["flagged_count"] == 1
     assert len(data2["flagged_comments"]) == 1
     assert "@viewer_one" in data2["flagged_comments"][0]["author"]
-    assert data2["grounded"] is True
-    assert data2["audience_reaction"]["source"] == "transcript-correlated"
-
-
-def test_enforce_video_grounding_drops_fabricated_timestamps():
-    """Timestamps not present in transcript.segments must be removed; with no transcript everything is forced empty."""
-    from src.api.bridge import _enforce_video_grounding
-
-    segments = [
-        {"timestamp": "00:00", "start": 0.0, "duration": 4.5, "text": "Kirish"},
-        {"timestamp": "02:00", "start": 120.4, "duration": 5.0, "text": "Soliq"},
-    ]
-    analysis = {
-        "summary": "x",
-        "key_moments": [
-            {"timestamp": "00:00", "topic": "Intro", "summary": "real"},
-            {"timestamp": "50:15", "topic": "Religious debate", "summary": "lifted from a comment"},
-            {"timestamp": "02:00", "topic": "Tax", "summary": "real"},
-        ],
-        "claims_and_allegations": [
-            {"timestamp": "01:10:00", "claim": "invented", "severity_score": 8},
-            {"timestamp": "[02:01]", "claim": "real within 1s", "severity_score": 5},
-        ],
-    }
-    reaction = {
-        "overall_sentiment": "hostile",
-        "reactions_by_video_part": [
-            {"video_part": "02:00 - Tax segment", "viewer_reaction": "angry"},
-            {"video_part": "15:00 - Critique of government", "viewer_reaction": "invented"},
-        ],
-    }
-
-    a, r, rep = _enforce_video_grounding(analysis, reaction, segments, True)
-    assert rep["grounded"] is True
-    assert [k["timestamp"] for k in a["key_moments"]] == ["00:00", "02:00"]
-    assert len(a["claims_and_allegations"]) == 1
-    assert len(r["reactions_by_video_part"]) == 1
-    assert rep["dropped_ungrounded_items"] == 3
-
-    # No transcript -> hard-force empty and label as comment-derived
-    a2, r2, rep2 = _enforce_video_grounding(analysis, reaction, [], False)
-    assert rep2["grounded"] is False
-    assert a2["grounded"] is False
-    assert a2["key_moments"] == []
-    assert a2["claims_and_allegations"] == []
-    assert r2["reactions_by_video_part"] == []
-    assert r2["source"] == "comment-derived, not transcript-correlated"
-    assert "grounding_note" in a2
 
 
 @pytest.mark.asyncio
-async def test_bridge_video_no_transcript_is_ungrounded_and_surfaces_bot_block(bridge_client, monkeypatch):
-    """When YouTube bot-blocks transcript extraction, the reason is surfaced and no timestamps are emitted."""
+async def test_bridge_video_gemini_direct_youtube_url_call(bridge_client, monkeypatch):
+    """Verify /api/video passes the YouTube URL directly in file_data.file_uri to Google's Gemini API (gemini-2.5-flash)."""
+    import json as _json
+    import httpx
+    from src.config import settings
     from src.collectors.youtube import YouTubeCollector
-    from src.llm.client import DeepSeekClassifier
 
-    async def mock_fetch(self, video_id: str, preferred_langs=None):
+    captured_gemini_requests = []
+
+    async def mock_fetch_video_metadata(self, video_id: str):
         return {
-            "video": {
-                "video_id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}",
-                "title": "Siyosiy suhbat", "channel_name": "Kanal", "channel_id": "UC1",
-                "published_at": "2026-10-31T11:06:06Z", "duration_seconds": 6290, "duration_formatted": "01:44:50",
-                "view_count": 78947, "like_count": 1527, "comment_count": 196,
-                "description": "", "tags": [], "category": None, "chapters": [],
-            },
-            "transcript": {
-                "available": False, "extraction_engine": None,
-                "playability_status": "LOGIN_REQUIRED",
-                "playability_reason": "Sign in to confirm you're not a bot",
-                "unavailable_reason": "YouTube bot-check blocked anonymous transcript extraction",
-                "language": None, "language_name": None, "is_auto_generated": False,
-                "available_languages": [], "segment_count": 0, "full_text": "", "segments": [],
-            },
+            "video_id": video_id,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "title": "Siyosiy suhbat",
+            "channel_name": "Kanal",
+            "published_at": "2026-10-31T11:06:06Z",
+            "duration_seconds": 6290,
+            "duration_formatted": "01:44:50",
+            "view_count": 78947,
+            "like_count": 1527,
+            "comment_count": 196,
         }
 
-    async def fabricating_llm(self, payload, max_retries=3):
-        return {
-            "summary": "likely a political talk",
-            "key_moments": [{"timestamp": "15:00", "topic": "Critique", "summary": "possibly"}],
-            "claims_and_allegations": [{"timestamp": "30:00", "claim": "invented", "severity_score": 7}],
+    async def mock_httpx_post(self, url, **kwargs):
+        captured_gemini_requests.append({"url": url, "params": kwargs.get("params"), "json": kwargs.get("json")})
+        gemini_output = {
+            "summary": "A 1h44m political discussion covering economic reforms, tariffs, and governance.",
+            "language": "uz",
+            "on_topic": True,
+            "severity_score": 6,
+            "severely_negative": False,
+            "tone_and_stance": "Critical policy debate",
+            "main_topics": ["Tariffs", "Governance"],
+            "key_moments": [
+                {"timestamp": "12:30", "topic": "Tariff policy", "summary": "Speakers debate energy tariff increases."}
+            ],
+            "claims_and_allegations": [
+                {"timestamp": "12:30", "claim": "Tariff hikes burden households.", "severity_score": 6}
+            ],
+            "risk_assessment": "Moderate policy criticism.",
+            "focused_answer": "The speaker argues at [12:30] that tariff increases need stronger oversight.",
             "audience_reaction": None,
         }
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"text": _json.dumps(gemini_output)}]
+                        }
+                    }
+                ]
+            },
+        )
 
-    monkeypatch.setattr(YouTubeCollector, "fetch_video_details_and_transcript", mock_fetch)
-    monkeypatch.setattr(DeepSeekClassifier, "analyze_video", fabricating_llm)
+    monkeypatch.setattr(settings, "GEMINI_API_KEY", "AIzaSyTestGeminiKey123")
+    monkeypatch.setattr(YouTubeCollector, "fetch_video_metadata", mock_fetch_video_metadata)
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_httpx_post)
 
-    resp = await bridge_client.post("/api/video", json={"url": "https://youtu.be/aircAruvnKk", "mode": "video"})
+    resp = await bridge_client.post(
+        "/api/video",
+        json={"url": "https://youtu.be/aircAruvnKk", "query": "What is said about tariffs?"},
+    )
     assert resp.status == 200
     data = await resp.json()
-    assert data["grounded"] is False
-    assert data["analysis"]["summary_source"] == "metadata_only"
-    assert "[metadata only — not transcript-verified]" in data["analysis"]["summary"]
-    assert data["analysis"]["key_moments"] == []
-    assert data["analysis"]["claims_and_allegations"] == []
-    assert data["transcript"]["playability_status"] == "LOGIN_REQUIRED"
-    assert "not a bot" in data["transcript"]["playability_reason"]
-    assert data["grounding"]["dropped_ungrounded_items"] == 2
+    assert data["provider"] == "gemini"
+    assert data["model"] == "gemini-2.5-flash"
+    assert data["focus"] == "What is said about tariffs?"
+    assert data["analysis"]["language"] == "uz"
+    assert data["analysis"]["focused_answer"] == "The speaker argues at [12:30] that tariff increases need stronger oversight."
+    assert len(captured_gemini_requests) == 1
+    sent_req = captured_gemini_requests[0]
+    assert "gemini-2.5-flash:generateContent" in sent_req["url"]
+    assert sent_req["params"]["key"] == "AIzaSyTestGeminiKey123"
+    parts = sent_req["json"]["contents"][0]["parts"]
+    assert parts[0]["file_data"]["file_uri"] == "https://www.youtube.com/watch?v=aircAruvnKk"
 
 
 def test_parse_youtube_timedtext_vtt():

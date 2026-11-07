@@ -989,6 +989,76 @@ class YouTubeCollector(BaseCollector):
         except Exception as pw_err:
             return [], None, None, False, [], str(pw_err)
 
+    async def fetch_video_metadata(self, video_id: str) -> Dict[str, Any]:
+        """Fetch lightweight YouTube video metadata (Data API v3 + oEmbed fallback) without running local transcript scrapers."""
+        vid = str(video_id).strip()
+        if not vid:
+            raise ScraperError("invalid video id", "Missing YouTube video ID", status_code=400)
+
+        video_meta: Dict[str, Any] = {
+            "video_id": vid,
+            "url": f"https://www.youtube.com/watch?v={vid}",
+            "title": None,
+            "channel_name": None,
+            "channel_id": None,
+            "published_at": None,
+            "duration_seconds": 0,
+            "duration_formatted": "00:00",
+            "view_count": 0,
+            "like_count": 0,
+            "comment_count": 0,
+        }
+
+        if self.api_key:
+            try:
+                v_resp = await self.http_client.get(
+                    "https://www.googleapis.com/youtube/v3/videos",
+                    params={
+                        "key": self.api_key,
+                        "part": "snippet,contentDetails,statistics",
+                        "id": vid,
+                    },
+                )
+                if v_resp.status_code == 200:
+                    items = (v_resp.json() or {}).get("items") or []
+                    if items:
+                        item = items[0]
+                        snip = item.get("snippet") or {}
+                        stats = item.get("statistics") or {}
+                        cdet = item.get("contentDetails") or {}
+
+                        video_meta["title"] = snip.get("title") or video_meta["title"]
+                        video_meta["channel_name"] = snip.get("channelTitle") or video_meta["channel_name"]
+                        video_meta["channel_id"] = snip.get("channelId") or video_meta["channel_id"]
+                        video_meta["published_at"] = snip.get("publishedAt") or video_meta["published_at"]
+
+                        dur_iso = parse_iso8601_duration(cdet.get("duration"))
+                        if dur_iso > 0:
+                            video_meta["duration_seconds"] = dur_iso
+                            video_meta["duration_formatted"] = format_seconds_to_timestamp(dur_iso)
+
+                        video_meta["view_count"] = int(stats.get("viewCount") or 0)
+                        video_meta["like_count"] = int(stats.get("likeCount") or 0)
+                        video_meta["comment_count"] = int(stats.get("commentCount") or 0)
+                        return video_meta
+            except Exception as e:
+                logger.warning("YouTube Data API v3 metadata lookup failed", video_id=vid, error=str(e))
+
+        # Lightweight oEmbed fallback if Data API v3 is not configured
+        try:
+            oembed_resp = await self.http_client.get(
+                "https://www.youtube.com/oembed",
+                params={"url": f"https://www.youtube.com/watch?v={vid}", "format": "json"},
+            )
+            if oembed_resp.status_code == 200:
+                odata = oembed_resp.json() or {}
+                video_meta["title"] = video_meta["title"] or odata.get("title")
+                video_meta["channel_name"] = video_meta["channel_name"] or odata.get("author_name")
+        except Exception as e:
+            logger.debug("YouTube oEmbed metadata lookup skipped", video_id=vid, error=str(e))
+
+        return video_meta
+
     async def fetch_video_details_and_transcript(
         self,
         video_id: str,

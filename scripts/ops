@@ -188,9 +188,9 @@ def build_parser() -> argparse.ArgumentParser:
         p_video = sub.add_parser(
             v_cmd,
             help=(
-                "Analyze a YouTube video. Supports two options:\n"
-                "  Option 1 (default): Analyze video content, transcript, key moments, claims & tone (--mode video).\n"
-                "  Option 2 (--reactions): Analyze video content AND viewer reactions to specific parts of the video."
+                "Analyze a YouTube video via Google Gemini (gemini-2.5-flash). Supports two options:\n"
+                "  Option 1 (default): Pass YouTube URL directly to Gemini for compact video summary, key moments, claims & query answers (--mode video).\n"
+                "  Option 2 (--reactions): Analyze video content via Gemini AND correlate viewer reactions from scraped comments."
             ),
         )
         p_video.add_argument("url", type=str, help="YouTube video URL, 11-char video ID, or YouTube channel @handle")
@@ -211,11 +211,13 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p_video.add_argument(
             "--focus",
+            "--query",
             "--question",
+            "-q",
             dest="focus",
             type=str,
             default="",
-            help="Optional question, timestamp, or specific part/topic in the video to focus on",
+            help="Optional specific question, query, timestamp, or topic in the video to answer",
         )
         p_video.add_argument(
             "--limit",
@@ -233,7 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--lang",
             type=str,
             default="",
-            help="Optional preferred transcript language codes (e.g. 'uz,ru,en')",
+            help="Optional preferred language hint (e.g. 'uz,ru,en')",
         )
 
     # 3e. ops untarget
