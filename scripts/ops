@@ -84,9 +84,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ops",
         description=(
-            "Operatives Intelligence CLI for Hermes Agent. "
-            "Queries PostgreSQL & triggers social scrapers (Telegram, Instagram, YouTube, X, Facebook), "
-            "returning compact pre-digested JSON (< 3 KB)."
+            "Operatives Intelligence CLI for Hermes Agent.\n"
+            "CRITICAL EXECUTION RULES:\n"
+            "  1. NEVER wrap `ops video` or `curl .../api/video` in a bash `for`/`while` loop or poll with `sleep` > 10s.\n"
+            "  2. Call `ops video` at most ONCE per video. If it returns `deterministic_failure: true` or HTTP 504, STOP IMMEDIATELY and fall back to metadata/comments.\n"
+            "  3. NEVER write custom Python/bash transcript scrapers (vidjob.py, yt-dlp subtitle loops, Invidious, etc.).\n"
+            "  4. When asked about company finances or spreadsheets, use the `sheets` CLI (`sheets list`, `sheets read`, `sheets update`, `sheets append`) to inspect and update Google Sheets."
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
@@ -188,7 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
         p_video = sub.add_parser(
             v_cmd,
             help=(
-                "Analyze a YouTube video via Google Gemini. Supports two options:\n"
+                "Analyze a YouTube video via Google Gemini (SINGLE ATTEMPT ONLY — NEVER loop or retry on 504/deterministic_failure).\n"
                 "  Option 1 (default): Pass YouTube URL directly to Gemini for compact video summary, key moments, claims & query answers (--mode video).\n"
                 "  Option 2 (--reactions): Analyze video content via Gemini AND correlate viewer reactions from scraped comments."
             ),
@@ -283,6 +286,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Add a burner session: --add x my_burner '{\"auth_token\":\"...\",\"ct0\":\"...\"}' (or --add youtube yt_proxy '{}' --proxy http://...)",
     )
 
+    # 6. ops sheets (also available as standalone `sheets` CLI)
+    p_sheets = sub.add_parser(
+        "sheets",
+        help="When asked about company finances or spreadsheets, inspect and update Google Sheets (list, read, update, append).",
+    )
+    p_sheets.add_argument("action", choices=["list", "read", "update", "append"], help="Action: list, read, update, append")
+    p_sheets.add_argument("args", nargs="*", help="Arguments for the action: [sheet_name_or_id] [range] [values_json]")
+
     return parser
 
 
@@ -362,7 +373,7 @@ def main():
                 "post_index": args.post_index,
                 "lang": args.lang or None,
             },
-            timeout=240,
+            timeout=480,
         )
     elif args.command == "untarget":
         res = api_request(
@@ -404,6 +415,51 @@ def main():
                     "reset": "true" if args.reset else "false",
                 },
             )
+    elif args.command == "sheets":
+        act = args.action
+        s_args = args.args or []
+        if act == "list":
+            res = api_request("/api/sheets", params={"action": "list"})
+        elif act == "read":
+            if not s_args:
+                res = {"error": "Usage: ops sheets read <sheet_name_or_id> [range]"}
+            else:
+                res = api_request(
+                    "/api/sheets",
+                    params={
+                        "action": "read",
+                        "sheet": s_args[0],
+                        "range": s_args[1] if len(s_args) > 1 else "",
+                    },
+                )
+        elif act == "update":
+            if len(s_args) < 3:
+                res = {"error": "Usage: ops sheets update <sheet_name_or_id> <range> <values_json>"}
+            else:
+                res = api_request(
+                    "/api/sheets",
+                    method="POST",
+                    body={
+                        "action": "update",
+                        "sheet": s_args[0],
+                        "range": s_args[1],
+                        "values": s_args[2],
+                    },
+                )
+        elif act == "append":
+            if len(s_args) < 2:
+                res = {"error": "Usage: ops sheets append <sheet_name_or_id> <values_json>"}
+            else:
+                res = api_request(
+                    "/api/sheets",
+                    method="POST",
+                    body={
+                        "action": "append",
+                        "sheet": s_args[0],
+                        "range": s_args[2] if len(s_args) > 2 else "",
+                        "values": s_args[1],
+                    },
+                )
     else:
         parser.print_help()
         sys.exit(1)

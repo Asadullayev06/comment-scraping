@@ -31,7 +31,13 @@ RUN playwright install --with-deps chromium
 # Copy application source
 COPY src/ /app/src/
 COPY scripts/ /app/scripts/
+COPY SKILL.md /app/SKILL.md
 COPY alembic.ini /app/alembic.ini
+
+# Install standalone CLIs (/usr/local/bin/ops and /usr/local/bin/sheets)
+RUN cp /app/scripts/ops /usr/local/bin/ops && \
+    cp /app/scripts/sheets /usr/local/bin/sheets && \
+    chmod +x /usr/local/bin/ops /usr/local/bin/sheets /app/scripts/sync_hermes.sh
 
 # Create session directory for persistent userbot session files
 RUN mkdir -p /app/sessions

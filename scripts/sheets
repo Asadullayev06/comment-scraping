@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""
+sheets - Standalone Zero-Dependency Google Sheets CLI for Hermes Agent
+Authenticates via GOOGLE_DRIVE_OAUTH_CLIENT_ID / GOOGLE_DRIVE_OAUTH_CLIENT_SECRET /
+GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN from environment variables (or via the Operatives Bridge
+at /api/sheets if invoked in a container without direct Google OAuth env vars).
+
+Commands:
+    sheets list
+    sheets read "<sheet_name_or_id>" [range]
+    sheets update "<sheet_name_or_id>" "<range>" "<values_json>"
+    sheets append "<sheet_name_or_id>" "<values_json>" [range]
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CANDIDATE_URLS = [
+    "http://10.0.4.1:18890",
+    "http://172.17.0.1:18890",
+    "http://host.docker.internal:18890",
+    "http://bot-controller:18890",
+    "http://127.0.0.1:18890",
+]
+
+
+def resolve_base_url() -> str:
+    env_url = os.environ.get("OPS_API_URL", "").strip().rstrip("/")
+    if env_url:
+        return env_url
+    for candidate in CANDIDATE_URLS:
+        try:
+            req = urllib.request.Request(f"{candidate}/health", method="GET")
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                if resp.status == 200:
+                    return candidate
+        except Exception:
+            continue
+    return CANDIDATE_URLS[0]
+
+
+def bridge_request(payload: dict, timeout: int = 35) -> dict:
+    base_url = resolve_base_url()
+    url = f"{base_url}/api/sheets"
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    api_key = os.environ.get("OPS_API_KEY", "").strip()
+    if api_key:
+        headers["X-API-Key"] = api_key
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return {"error": f"HTTP {e.code}: {e.reason}"}
+    except Exception as e:
+        return {"error": f"Failed to reach Google Sheets bridge at {base_url}: {e}"}
+
+
+def has_local_oauth_env() -> bool:
+    return bool(
+        os.environ.get("GOOGLE_DRIVE_OAUTH_CLIENT_ID", "").strip()
+        and os.environ.get("GOOGLE_DRIVE_OAUTH_CLIENT_SECRET", "").strip()
+        and os.environ.get("GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN", "").strip()
+    )
+
+
+def get_oauth_access_token() -> str:
+    data = urllib.parse.urlencode(
+        {
+            "client_id": os.environ["GOOGLE_DRIVE_OAUTH_CLIENT_ID"].strip(),
+            "client_secret": os.environ["GOOGLE_DRIVE_OAUTH_CLIENT_SECRET"].strip(),
+            "refresh_token": os.environ["GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN"].strip(),
+            "grant_type": "refresh_token",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token",
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+        return payload["access_token"]
+
+
+def google_http_json(url: str, token: str, method: str = "GET", body: dict = None) -> dict:
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def normalize_values(raw_val: str):
+    stripped = (raw_val or "").strip()
+    if not stripped:
+        return [[""]]
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        if stripped.startswith("[") and stripped.endswith("]"):
+            inner = stripped[1:-1].strip()
+            parsed = [x.strip().strip("'\"") for x in inner.split(",")] if inner else []
+        else:
+            parsed = [[stripped]]
+    if isinstance(parsed, list):
+        if not parsed:
+            return [[]]
+        if all(isinstance(r, list) for r in parsed):
+            return parsed
+        return [parsed]
+    return [[parsed]]
+
+
+def resolve_sheet_id_direct(token: str, name_or_id: str, folder_id: str = None):
+    clean = (name_or_id or "").strip()
+    m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]{15,})", clean)
+    if m:
+        return m.group(1), None
+
+    for search_folder in ([folder_id, None] if folder_id else [None]):
+        q_parts = ["mimeType='application/vnd.google-apps.spreadsheet'", "trashed=false"]
+        if search_folder:
+            q_parts.insert(0, f"'{search_folder}' in parents")
+        params = urllib.parse.urlencode(
+            {
+                "q": " and ".join(q_parts),
+                "fields": "files(id,name)",
+                "pageSize": 100,
+                "includeItemsFromAllDrives": "true",
+                "supportsAllDrives": "true",
+            }
+        )
+        res = google_http_json(f"https://www.googleapis.com/drive/v3/files?{params}", token)
+        files = res.get("files") or []
+        for f in files:
+            if f.get("id") == clean:
+                return f["id"], f.get("name")
+        for f in files:
+            if (f.get("name") or "").strip().lower() == clean.lower():
+                return f["id"], f.get("name")
+        for f in files:
+            if clean.lower() in (f.get("name") or "").lower():
+                return f["id"], f.get("name")
+
+    if re.match(r"^[A-Za-z0-9_-]{20,}$", clean):
+        return clean, None
+    raise ValueError(f"Could not find spreadsheet '{clean}'. Run 'sheets list' to see available spreadsheets.")
+
+
+def run_direct(args) -> dict:
+    token = get_oauth_access_token()
+    folder_id = (getattr(args, "folder_id", None) or os.environ.get("GOOGLE_DRIVE_FOLDER_ID") or "").strip() or None
+
+    if args.command == "list":
+        q_parts = ["mimeType='application/vnd.google-apps.spreadsheet'", "trashed=false"]
+        if folder_id:
+            q_parts.insert(0, f"'{folder_id}' in parents")
+        params = urllib.parse.urlencode(
+            {
+                "q": " and ".join(q_parts),
+                "fields": "files(id,name,modifiedTime,webViewLink)",
+                "orderBy": "modifiedTime desc",
+                "pageSize": 100,
+                "includeItemsFromAllDrives": "true",
+                "supportsAllDrives": "true",
+            }
+        )
+        res = google_http_json(f"https://www.googleapis.com/drive/v3/files?{params}", token)
+        files = res.get("files") or []
+        items = [
+            {
+                "id": f.get("id"),
+                "name": f.get("name"),
+                "modified_time": f.get("modifiedTime"),
+                "url": f.get("webViewLink") or f"https://docs.google.com/spreadsheets/d/{f.get('id')}/edit",
+            }
+            for f in files
+        ]
+        return {"status": "ok", "folder_id": folder_id, "count": len(items), "spreadsheets": items}
+
+    spreadsheet_id, matched_name = resolve_sheet_id_direct(token, args.sheet, folder_id)
+    meta = google_http_json(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}?fields=spreadsheetId,properties.title,sheets.properties(title)",
+        token,
+    )
+    title = (meta.get("properties") or {}).get("title") or matched_name
+    tabs = [
+        (s.get("properties") or {}).get("title")
+        for s in (meta.get("sheets") or [])
+        if (s.get("properties") or {}).get("title")
+    ]
+    default_tab = tabs[0] if tabs else "Sheet1"
+
+    if args.command == "read":
+        eff_range = (args.range or "").strip() or default_tab
+        enc = urllib.parse.quote(eff_range, safe="!:$'")
+        val_res = google_http_json(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{enc}?valueRenderOption=FORMATTED_VALUE",
+            token,
+        )
+        rows = val_res.get("values") or []
+        return {
+            "status": "ok",
+            "spreadsheet_id": spreadsheet_id,
+            "title": title,
+            "sheets": tabs,
+            "range": val_res.get("range") or eff_range,
+            "row_count": len(rows),
+            "values": rows,
+        }
+
+    if args.command == "update":
+        eff_range = (args.range or "").strip()
+        vals = normalize_values(args.values_json)
+        enc = urllib.parse.quote(eff_range, safe="!:$'")
+        up_res = google_http_json(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{enc}?valueInputOption=USER_ENTERED",
+            token,
+            method="PUT",
+            body={"range": eff_range, "majorDimension": "ROWS", "values": vals},
+        )
+        return {
+            "status": "updated",
+            "spreadsheet_id": spreadsheet_id,
+            "title": title,
+            "updated_range": up_res.get("updatedRange") or eff_range,
+            "updated_rows": up_res.get("updatedRows", len(vals)),
+            "updated_columns": up_res.get("updatedColumns"),
+            "updated_cells": up_res.get("updatedCells"),
+        }
+
+    if args.command == "append":
+        eff_range = (getattr(args, "range", None) or "").strip() or default_tab
+        vals = normalize_values(args.values_json)
+        enc = urllib.parse.quote(eff_range, safe="!:$'")
+        ap_res = google_http_json(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{enc}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS",
+            token,
+            method="POST",
+            body={"majorDimension": "ROWS", "values": vals},
+        )
+        updates = ap_res.get("updates") or {}
+        return {
+            "status": "appended",
+            "spreadsheet_id": spreadsheet_id,
+            "title": title,
+            "table_range": ap_res.get("tableRange"),
+            "updated_range": updates.get("updatedRange"),
+            "updated_rows": updates.get("updatedRows", len(vals)),
+            "updated_cells": updates.get("updatedCells"),
+        }
+
+    return {"error": f"Unknown command: {args.command}"}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sheets",
+        description="Google Sheets CLI for Hermes Agent (list, read, update, append).",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_list = sub.add_parser("list", help="List all spreadsheets in the configured Google Drive folder.")
+    p_list.add_argument("--folder-id", type=str, default="", help="Optional Google Drive folder ID override")
+
+    p_read = sub.add_parser("read", help='Read data from a spreadsheet: sheets read "<sheet_name_or_id>" [range]')
+    p_read.add_argument("sheet", type=str, help="Spreadsheet name, ID, or Google Sheets URL")
+    p_read.add_argument("range", nargs="?", default="", help="Optional A1 range (e.g. 'A1:E20' or 'Sheet1!A1:E20')")
+
+    p_update = sub.add_parser("update", help='Update cells: sheets update "<sheet_name_or_id>" "<range>" "<values_json>"')
+    p_update.add_argument("sheet", type=str, help="Spreadsheet name, ID, or Google Sheets URL")
+    p_update.add_argument("range", type=str, help="Target cell or range (e.g. 'B5' or 'A1:D2')")
+    p_update.add_argument("values_json", type=str, help='JSON values array (e.g. \'[["Item", 100]]\' or \'["Item", 100]\')')
+
+    p_append = sub.add_parser("append", help='Append a row: sheets append "<sheet_name_or_id>" "<values_json>" [range]')
+    p_append.add_argument("sheet", type=str, help="Spreadsheet name, ID, or Google Sheets URL")
+    p_append.add_argument("values_json", type=str, help='JSON row values (e.g. \'["2026-11-08", "Hosting", -250]\')')
+    p_append.add_argument("range", nargs="?", default="", help="Optional target worksheet tab name or range")
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if has_local_oauth_env():
+        try:
+            res = run_direct(args)
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = json.loads(e.read().decode("utf-8"))
+            except Exception:
+                err_body = {"error": f"HTTP {e.code}: {e.reason}"}
+            res = err_body
+        except Exception as e:
+            res = {"error": str(e)}
+    else:
+        payload = {"action": args.command}
+        if args.command == "list":
+            payload["folder_id"] = getattr(args, "folder_id", "") or None
+        elif args.command == "read":
+            payload["sheet"] = args.sheet
+            payload["range"] = args.range or None
+        elif args.command == "update":
+            payload["sheet"] = args.sheet
+            payload["range"] = args.range
+            payload["values"] = args.values_json
+        elif args.command == "append":
+            payload["sheet"] = args.sheet
+            payload["values"] = args.values_json
+            payload["range"] = getattr(args, "range", "") or None
+        res = bridge_request(payload)
+
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

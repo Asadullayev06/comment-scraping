@@ -571,6 +571,11 @@ async def handle_health_detailed(request: web.Request) -> web.Response:
                 "gemini_api_key": bool(settings.GEMINI_API_KEY),
                 "youtube_api_key": bool(settings.YOUTUBE_API_KEY),
                 "x_bearer_token": bool(settings.X_BEARER_TOKEN),
+                "google_sheets_oauth": bool(
+                    settings.GOOGLE_DRIVE_OAUTH_CLIENT_ID
+                    and settings.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET
+                    and settings.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN
+                ),
             },
         }
     )
@@ -2473,6 +2478,7 @@ async def handle_video(request: web.Request) -> web.Response:
                 "title": video_meta.get("title"),
                 "channel_name": video_meta.get("channel_name"),
                 "published_at": video_meta.get("published_at"),
+                "duration_seconds": video_meta.get("duration_seconds") or 0,
                 "duration_formatted": video_meta.get("duration_formatted"),
                 "view_count": video_meta.get("view_count"),
                 "like_count": video_meta.get("like_count"),
@@ -2596,17 +2602,92 @@ async def handle_video(request: web.Request) -> web.Response:
 
     except ScraperError as s_err:
         return web.json_response(
-            {"error": s_err.error_code, "message": s_err.message, "platform": "youtube"},
+            {
+                "error": s_err.error_code,
+                "message": s_err.message,
+                "deterministic_failure": True,
+                "reason": s_err.message,
+                "do_not_retry": True,
+                "platform": "youtube",
+            },
             status=s_err.status_code,
         )
     except Exception as exc:
         logger.exception("Unhandled error in handle_video", error=str(exc), exc_info=True)
         return web.json_response(
-            {"error": "server_error", "message": f"Video analysis failed: {exc}", "platform": "youtube"},
+            {
+                "error": "server_error",
+                "message": f"Video analysis failed: {exc}",
+                "deterministic_failure": True,
+                "reason": f"Video analysis failed: {exc}",
+                "do_not_retry": True,
+                "platform": "youtube",
+            },
             status=500,
         )
     finally:
         await yt_collector.stop()
+
+
+async def handle_sheets(request: web.Request) -> web.Response:
+    """GET/POST /api/sheets — Google Drive/Sheets inspection & update endpoint for /usr/local/bin/sheets CLI."""
+    from src.collectors.google_sheets import GoogleSheetsClient
+
+    body: Dict[str, Any] = {}
+    if request.can_read_body:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+    action = (body.get("action") or request.query.get("action") or "list").strip().lower()
+    sheet = (body.get("sheet") or body.get("name") or body.get("id") or request.query.get("sheet") or "").strip()
+    range_str = (body.get("range") or request.query.get("range") or "").strip() or None
+    values = body.get("values") if "values" in body else request.query.get("values")
+    folder_id = (body.get("folder_id") or request.query.get("folder_id") or "").strip() or None
+
+    gs_client = GoogleSheetsClient(folder_id=folder_id)
+    try:
+        if action == "list":
+            res = await gs_client.list_spreadsheets(folder_id=folder_id)
+            return web.json_response(res)
+        if action == "read":
+            res = await gs_client.read_sheet(name_or_id=sheet, range_str=range_str)
+            return web.json_response(res)
+        if action == "update":
+            if not range_str:
+                return web.json_response({"error": "missing range", "message": "Provide a range for sheets update."}, status=400)
+            res = await gs_client.update_sheet(name_or_id=sheet, range_str=range_str, raw_values=values)
+            return web.json_response(res)
+        if action == "append":
+            res = await gs_client.append_sheet(name_or_id=sheet, raw_values=values, range_str=range_str)
+            return web.json_response(res)
+        return web.json_response({"error": "invalid action", "message": f"Unknown sheets action '{action}'. Use list, read, update, or append."}, status=400)
+    except ScraperError as s_err:
+        return web.json_response({"error": s_err.error_code, "message": s_err.message}, status=s_err.status_code)
+    except Exception as exc:
+        logger.exception("Unhandled error in handle_sheets", error=str(exc), exc_info=True)
+        return web.json_response({"error": "server_error", "message": str(exc)}, status=500)
+
+
+async def handle_cli_download(request: web.Request) -> web.Response:
+    """GET /api/cli/{tool} — Serve standalone CLI scripts (ops, sheets, SKILL.md) to the Hermes container."""
+    from pathlib import Path
+
+    tool = (request.match_info.get("tool") or "").strip().lower()
+    root_dir = Path(__file__).resolve().parent.parent.parent
+    file_map = {
+        "ops": root_dir / "scripts" / "ops",
+        "sheets": root_dir / "scripts" / "sheets",
+        "skill": root_dir / "SKILL.md",
+        "skill.md": root_dir / "SKILL.md",
+        "sync": root_dir / "scripts" / "sync_hermes.sh",
+        "sync_hermes.sh": root_dir / "scripts" / "sync_hermes.sh",
+    }
+    target_path = file_map.get(tool)
+    if not target_path or not target_path.exists():
+        return web.json_response({"error": f"Unknown CLI artifact '{tool}'"}, status=404)
+    return web.Response(text=target_path.read_text(encoding="utf-8"), content_type="text/plain")
 
 
 def create_bridge_app(mtproto: Optional[Any] = None) -> web.Application:
@@ -2643,6 +2724,9 @@ def create_bridge_app(mtproto: Optional[Any] = None) -> web.Application:
     app.router.add_get("/api/search", handle_search)
     app.router.add_get("/api/sessions", handle_sessions)
     app.router.add_post("/api/sessions", handle_sessions)
+    app.router.add_get("/api/sheets", handle_sheets)
+    app.router.add_post("/api/sheets", handle_sheets)
+    app.router.add_get("/api/cli/{tool}", handle_cli_download)
     return app
 
 

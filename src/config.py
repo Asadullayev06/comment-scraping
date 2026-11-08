@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: Optional[str] = Field(default=None)
     GEMINI_MODEL: str = Field(default="gemini-3.8-flash")
 
+    # Google Drive & Google Sheets OAuth Configuration
+    GOOGLE_DRIVE_OAUTH_CLIENT_ID: Optional[str] = Field(default=None)
+    GOOGLE_DRIVE_OAUTH_CLIENT_SECRET: Optional[str] = Field(default=None)
+    GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN: Optional[str] = Field(default=None)
+    GOOGLE_DRIVE_FOLDER_ID: Optional[str] = Field(default=None)
+
     # X (Twitter) Official API v2 Bearer Token (Optional alternative to burner cookies)
     X_BEARER_TOKEN: Optional[str] = Field(default=None)
 

@@ -1289,13 +1289,14 @@ async def test_bridge_youtube_video_analysis_option1_and_option2(bridge_client, 
 
 @pytest.mark.asyncio
 async def test_bridge_video_gemini_direct_youtube_url_call(bridge_client, monkeypatch):
-    """Verify /api/video passes the YouTube URL directly in file_data.file_uri to Google's Gemini API (gemini-2.5-flash)."""
+    """Verify /api/video tiered duration strategy (Tier 1 <=20m, Tier 2 20-60m, Tier 3 >60m chunked) and fast-fail 504 semantics."""
     import json as _json
     import httpx
     from src.config import settings
     from src.collectors.youtube import YouTubeCollector
 
     captured_gemini_requests = []
+    mock_duration_state = {"seconds": 600, "formatted": "10:00", "fail_504": False}
 
     async def mock_fetch_video_metadata(self, video_id: str):
         return {
@@ -1304,8 +1305,8 @@ async def test_bridge_video_gemini_direct_youtube_url_call(bridge_client, monkey
             "title": "Siyosiy suhbat",
             "channel_name": "Kanal",
             "published_at": "2026-10-31T11:06:06Z",
-            "duration_seconds": 6290,
-            "duration_formatted": "01:44:50",
+            "duration_seconds": mock_duration_state["seconds"],
+            "duration_formatted": mock_duration_state["formatted"],
             "view_count": 78947,
             "like_count": 1527,
             "comment_count": 196,
@@ -1313,8 +1314,11 @@ async def test_bridge_video_gemini_direct_youtube_url_call(bridge_client, monkey
 
     async def mock_httpx_post(self, url, **kwargs):
         captured_gemini_requests.append({"url": url, "params": kwargs.get("params"), "json": kwargs.get("json")})
+        if mock_duration_state["fail_504"]:
+            return httpx.Response(504, text="Gateway Timeout")
+
         gemini_output = {
-            "summary": "A 1h44m political discussion covering economic reforms, tariffs, and governance.",
+            "summary": "Political discussion covering economic reforms, tariffs, and governance.",
             "language": "uz",
             "on_topic": True,
             "severity_score": 6,
@@ -1322,13 +1326,13 @@ async def test_bridge_video_gemini_direct_youtube_url_call(bridge_client, monkey
             "tone_and_stance": "Critical policy debate",
             "main_topics": ["Tariffs", "Governance"],
             "key_moments": [
-                {"timestamp": "12:30", "topic": "Tariff policy", "summary": "Speakers debate energy tariff increases."}
+                {"timestamp": "02:30", "topic": "Tariff policy", "summary": "Speakers debate energy tariff increases."}
             ],
             "claims_and_allegations": [
-                {"timestamp": "12:30", "claim": "Tariff hikes burden households.", "severity_score": 6}
+                {"timestamp": "02:30", "claim": "Tariff hikes burden households.", "severity_score": 6}
             ],
             "risk_assessment": "Moderate policy criticism.",
-            "focused_answer": "The speaker argues at [12:30] that tariff increases need stronger oversight.",
+            "focused_answer": "The speaker argues at [02:30] that tariff increases need stronger oversight.",
             "audience_reaction": None,
         }
         return httpx.Response(
@@ -1367,6 +1371,7 @@ async def test_bridge_video_gemini_direct_youtube_url_call(bridge_client, monkey
     monkeypatch.setattr(YouTubeCollector, "fetch_fast_transcript", mock_fetch_fast_transcript_unavailable)
     monkeypatch.setattr(httpx.AsyncClient, "post", mock_httpx_post)
 
+    # 1. Tier 1 (<= 1200s / 10m): Full video, default resolution, mime_type="video/*"
     resp = await bridge_client.post(
         "/api/video",
         json={"url": "https://youtu.be/aircAruvnKk", "query": "What is said about tariffs?"},
@@ -1382,16 +1387,150 @@ async def test_bridge_video_gemini_direct_youtube_url_call(bridge_client, monkey
     assert data["analysis"]["summary_source"] == "gemini_video"
     assert data["focus"] == "What is said about tariffs?"
     assert data["analysis"]["language"] == "uz"
-    assert data["analysis"]["focused_answer"] == "The speaker argues at [12:30] that tariff increases need stronger oversight."
     assert len(captured_gemini_requests) == 1
     sent_req = captured_gemini_requests[0]
     assert "gemini-3.8-flash:generateContent" in sent_req["url"]
     assert sent_req["params"]["key"] == "AIzaSyTestGeminiKey123"
     parts = sent_req["json"]["contents"][0]["parts"]
     assert parts[0]["file_data"]["file_uri"] == "https://www.youtube.com/watch?v=aircAruvnKk"
+    assert parts[0]["file_data"]["mime_type"] == "video/*"
     gen_cfg = sent_req["json"]["generationConfig"]
     assert gen_cfg["thinkingConfig"] == {"thinkingBudget": 0}
-    assert gen_cfg["mediaResolution"] == "MEDIA_RESOLUTION_LOW"
+    assert "mediaResolution" not in gen_cfg
+
+    # 2. Tier 2 (1200s < dur <= 3600s / 40m): Full video, MEDIA_RESOLUTION_LOW + video_metadata={"fps": 1.0}
+    captured_gemini_requests.clear()
+    mock_duration_state["seconds"] = 2400
+    mock_duration_state["formatted"] = "40:00"
+    resp_t2 = await bridge_client.post(
+        "/api/video",
+        json={"url": "https://youtu.be/aircAruvnKk"},
+    )
+    assert resp_t2.status == 200
+    assert len(captured_gemini_requests) == 1
+    parts_t2 = captured_gemini_requests[0]["json"]["contents"][0]["parts"]
+    assert parts_t2[0]["file_data"]["mime_type"] == "video/*"
+    assert parts_t2[0]["video_metadata"] == {"fps": 1.0}
+    assert captured_gemini_requests[0]["json"]["generationConfig"]["mediaResolution"] == "MEDIA_RESOLUTION_LOW"
+
+    # 3. Tier 3 (dur > 3600s / 1h44m50s = 6290s): 7 parallel 900s chunks (fps=0.5, MEDIA_RESOLUTION_LOW) + 1 text merge call
+    captured_gemini_requests.clear()
+    mock_duration_state["seconds"] = 6290
+    mock_duration_state["formatted"] = "01:44:50"
+    resp_t3 = await bridge_client.post(
+        "/api/video",
+        json={"url": "https://youtu.be/aircAruvnKk"},
+    )
+    assert resp_t3.status == 200
+    # 7 video chunk requests + 1 text merge request = 8 total requests
+    assert len(captured_gemini_requests) == 8
+    chunk_reqs = [r for r in captured_gemini_requests if "file_data" in r["json"]["contents"][0]["parts"][0]]
+    assert len(chunk_reqs) == 7
+    assert chunk_reqs[0]["json"]["contents"][0]["parts"][0]["video_metadata"] == {
+        "start_offset": "0s",
+        "end_offset": "900s",
+        "fps": 0.5,
+    }
+    assert chunk_reqs[1]["json"]["contents"][0]["parts"][0]["video_metadata"] == {
+        "start_offset": "900s",
+        "end_offset": "1800s",
+        "fps": 0.5,
+    }
+
+    # 4. Fast-fail 504: No retries on 504, returns deterministic_failure=True immediately
+    captured_gemini_requests.clear()
+    mock_duration_state["seconds"] = 600
+    mock_duration_state["formatted"] = "10:00"
+    mock_duration_state["fail_504"] = True
+    resp_504 = await bridge_client.post(
+        "/api/video",
+        json={"url": "https://youtu.be/aircAruvnKk"},
+    )
+    assert resp_504.status == 504
+    err_504 = await resp_504.json()
+    assert err_504["deterministic_failure"] is True
+    assert err_504["do_not_retry"] is True
+    assert "reason" in err_504
+    assert len(captured_gemini_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_bridge_google_sheets_and_cli_endpoints(bridge_client, monkeypatch):
+    """Verify /api/sheets (list, read, update, append) and /api/cli/{tool} download endpoints."""
+    from src.collectors.google_sheets import GoogleSheetsClient
+
+    async def mock_list(self, folder_id=None):
+        return {
+            "status": "ok",
+            "folder_id": folder_id or "folder_123",
+            "count": 1,
+            "spreadsheets": [{"id": "sheet_abc_123", "name": "Company Finances 2026"}],
+        }
+
+    async def mock_read(self, name_or_id, range_str=None):
+        return {
+            "status": "ok",
+            "spreadsheet_id": "sheet_abc_123",
+            "spreadsheet_name": "Company Finances 2026",
+            "range": range_str or "Sheet1!A1:B2",
+            "row_count": 2,
+            "values": [["Month", "Revenue"], ["November", "125000"]],
+        }
+
+    async def mock_update(self, name_or_id, range_str, raw_values):
+        return {
+            "status": "ok",
+            "action": "update",
+            "spreadsheet_id": "sheet_abc_123",
+            "updated_range": range_str,
+            "updated_cells": 2,
+        }
+
+    async def mock_append(self, name_or_id, raw_values, range_str=None):
+        return {
+            "status": "ok",
+            "action": "append",
+            "spreadsheet_id": "sheet_abc_123",
+            "updated_range": "Sheet1!A3:B3",
+            "updated_rows": 1,
+        }
+
+    monkeypatch.setattr(GoogleSheetsClient, "list_spreadsheets", mock_list)
+    monkeypatch.setattr(GoogleSheetsClient, "read_sheet", mock_read)
+    monkeypatch.setattr(GoogleSheetsClient, "update_sheet", mock_update)
+    monkeypatch.setattr(GoogleSheetsClient, "append_sheet", mock_append)
+
+    r_list = await bridge_client.get("/api/sheets?action=list")
+    assert r_list.status == 200
+    d_list = await r_list.json()
+    assert d_list["count"] == 1
+    assert d_list["spreadsheets"][0]["name"] == "Company Finances 2026"
+
+    r_read = await bridge_client.get("/api/sheets?action=read&sheet=Company+Finances+2026&range=A1:B2")
+    assert r_read.status == 200
+    d_read = await r_read.json()
+    assert d_read["row_count"] == 2
+    assert d_read["values"][1][1] == "125000"
+
+    r_upd = await bridge_client.post(
+        "/api/sheets",
+        json={"action": "update", "sheet": "Company Finances 2026", "range": "B2", "values": [["130000"]]},
+    )
+    assert r_upd.status == 200
+    assert (await r_upd.json())["action"] == "update"
+
+    r_app = await bridge_client.post(
+        "/api/sheets",
+        json={"action": "append", "sheet": "Company Finances 2026", "values": ["December", "140000"]},
+    )
+    assert r_app.status == 200
+    assert (await r_app.json())["action"] == "append"
+
+    for tool_name in ("ops", "sheets", "skill", "sync"):
+        cli_resp = await bridge_client.get(f"/api/cli/{tool_name}")
+        assert cli_resp.status == 200
+        text = await cli_resp.text()
+        assert len(text) > 100
 
 
 def test_parse_youtube_timedtext_vtt():
